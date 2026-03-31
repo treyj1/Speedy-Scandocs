@@ -13,21 +13,27 @@ ROOT = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
 
 # Tesseract paths on the build machine (GitHub Actions macos-13 runner
 # with 'brew install tesseract' already run, or a local Mac with Homebrew)
-TESS_BINARY   = "/opt/homebrew/bin/tesseract"   # Apple Silicon
-TESS_TESSDATA = "/opt/homebrew/share/tessdata"
+TESS_BINARY = "/opt/homebrew/bin/tesseract"       # Apple Silicon
+TESS_ROOT   = "/opt/homebrew"
 if not os.path.isfile(TESS_BINARY):
-    TESS_BINARY   = "/usr/local/bin/tesseract"   # Intel Mac
-    TESS_TESSDATA = "/usr/local/share/tessdata"
+    TESS_BINARY = "/usr/local/bin/tesseract"      # Intel Mac
+    TESS_ROOT   = "/usr/local"
+
+# Only bundle English language data — keeps the DMG small
+TESS_ENG = os.path.join(TESS_ROOT, "share", "tessdata", "eng.traineddata")
+TESS_OSD = os.path.join(TESS_ROOT, "share", "tessdata", "osd.traineddata")
 
 a = Analysis(
     [os.path.join(ROOT, 'scandocs_tool.py')],
     pathex=[ROOT],
-    binaries=[],
+    binaries=[
+        (TESS_BINARY, '.'),     # tesseract binary — PyInstaller will collect its dylibs too
+    ],
     datas=[
         (os.path.join(ROOT, 'assets'),          'assets'),
         (os.path.join(ROOT, 'client_list.txt'), '.'),
-        (TESS_BINARY,   '.'),                   # tesseract binary -> bundle root
-        (TESS_TESSDATA, 'tessdata'),            # language data
+        (TESS_ENG, 'tessdata'),                 # English language data
+        (TESS_OSD, 'tessdata'),                 # Script detection data
     ],
     hiddenimports=[
         'ttkbootstrap',

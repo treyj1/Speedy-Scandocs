@@ -21,7 +21,13 @@ jobs:
           python-version: '3.11'
 
       - name: Install Tesseract (needed to bundle into app)
-        run: choco install tesseract --yes --no-progress
+        run: |
+          $releases = Invoke-RestMethod 'https://api.github.com/repos/UB-Mannheim/tesseract/releases/latest'
+          $asset = $releases.assets | Where-Object { $_.name -match 'tesseract-ocr-w64-setup.*\.exe$' } | Select-Object -First 1
+          Write-Host "Downloading $($asset.name)..."
+          Invoke-WebRequest -Uri $asset.browser_download_url -OutFile 'tesseract-setup.exe' -UseBasicParsing
+          Start-Process -FilePath 'tesseract-setup.exe' -ArgumentList '/S' -Wait
+          Write-Host "Tesseract installed."
         shell: pwsh
 
       - name: Install dependencies
