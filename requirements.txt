@@ -1,0 +1,6 @@
+PyMuPDF>=1.23.0
+requests>=2.31.0
+pytesseract>=0.3.10
+Pillow>=9.0.0
+ttkbootstrap>=1.10.0
+openpyxl>=3.1.0

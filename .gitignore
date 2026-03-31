@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Logs
+*.log
+
+# User-specific config (contains hardcoded local paths)
+config.json
+
+# Generated reports (may contain client data)
+Reports/
+
+# PyInstaller build output
+dist/
+build/windows/Output/
+
+# Tesseract installer binary (too large for git — download separately)
+build/windows/Installers/*.exe
+
+# Claude Code settings
+.claude/
+
+# Windows artifacts
+Thumbs.db
+Desktop.ini

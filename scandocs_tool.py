@@ -1,0 +1,3937 @@
+#!/usr/bin/env python3
+"""
+Speedy Scandocs
+Automatically classifies and renames scanned law firm documents
+using a local AI model (OpenWebUI / Ollama).
+
+Usage:
+    python scandocs_tool.py
+
+Requirements:
+    pip install -r requirements.txt
+"""
+
+import os
+import re
+import sys
+import json
+import base64
+import difflib
+import logging
+import threading
+import queue
+import csv
+import datetime
+import subprocess
+
+try:
+    import openpyxl
+    from openpyxl.styles import Font, PatternFill, Alignment
+    _XLSX_AVAILABLE = True
+except ImportError:
+    _XLSX_AVAILABLE = False
+from dataclasses import dataclass
+from typing import Optional
+
+import tkinter as tk
+from tkinter import messagebox, filedialog
+import ttkbootstrap as ttk
+
+try:
+    import fitz  # PyMuPDF
+except ImportError:
+    fitz = None
+
+try:
+    import requests
+except ImportError:
+    requests = None
+
+try:
+    import pytesseract
+except ImportError:
+    pytesseract = None
+
+try:
+    from PIL import Image as PILImage, ImageTk as PILImageTk
+except ImportError:
+    PILImage = None
+    PILImageTk = None
+
+
+# ─────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────
+
+
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
+
+# ── Colour-palette definitions ─────────────────────────────────────────────
+# App primary color — fixed, no user-selectable palette
+_APP_PRIMARY   = "#1565c0"
+_APP_LIGHT     = "#e3f2fd"
+_APP_MID       = "#1976d2"
+CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
+LOG_PATH = os.path.join(SCRIPT_DIR, "scandocs_tool.log")
+DEFAULT_REPORTS_FOLDER = os.path.join(SCRIPT_DIR, "Reports")
+
+
+def _open_file(path: str):
+    """Open a file with the default system viewer — cross-platform."""
+    if sys.platform == "win32":
+        _open_file(path)
+    elif sys.platform == "darwin":
+        subprocess.run(["open", path])
+    else:
+        subprocess.run(["xdg-open", path])
+
+
+# ── PyInstaller bundle: point pytesseract at the bundled Tesseract binary ──
+# When running as a packaged app, sys._MEIPASS is set to the bundle directory.
+_bundle_dir = getattr(sys, "_MEIPASS", None)
+if _bundle_dir:
+    try:
+        import pytesseract as _pt
+        _bundled_tess = os.path.join(_bundle_dir, "tesseract")
+        if os.path.isfile(_bundled_tess):
+            _pt.pytesseract.tesseract_cmd = _bundled_tess
+            os.environ["TESSDATA_PREFIX"] = os.path.join(_bundle_dir, "tessdata")
+    except ImportError:
+        pass
+else:
+    # Not bundled — try known system install locations (Windows + Mac Homebrew)
+    _TESS_CANDIDATES = [
+        r"C:\Program Files\Tesseract-OCR\tesseract.exe",
+        r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
+        r"C:\Users\treyj\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
+        "/opt/homebrew/bin/tesseract",   # Mac Apple Silicon (Homebrew)
+        "/usr/local/bin/tesseract",      # Mac Intel (Homebrew)
+    ]
+    try:
+        import pytesseract as _pt
+        for _p in _TESS_CANDIDATES:
+            if os.path.isfile(_p):
+                _pt.pytesseract.tesseract_cmd = _p
+                break
+    except ImportError:
+        pass
+
+DEFAULT_CONFIG: dict = {
+    "paths": {
+        "scandocs_folder": "",
+        "client_list_file": os.path.join(SCRIPT_DIR, "client_list.txt"),
+    },
+    "api": {
+        "openwebui_url": "http://localhost:3000",
+        "ollama_url": "http://localhost:11434",
+        "model": "llama3.2-vision",
+        "api_key": "",
+        "timeout_connect": 10,
+        "timeout_read": 120,
+    },
+    "processing": {
+        "fuzzy_threshold": 0.82,
+        "max_ocr_chars": 8000,
+        "require_high_confidence": True,
+        "max_pages": 5,
+        "skip_already_processed": True,
+        "audit_mode": True,
+        "file_mode": False,
+        "file_mode_destination": "",
+        "suggest_location_enabled": False,
+        "suggest_location_parent_folder": "",
+        "auto_commit_moves": False,
+        "candidate_list_size": 10,
+    },
+    "reports": {
+        "auto_save": True,
+        "report_folder": DEFAULT_REPORTS_FOLDER,
+    },
+}
+
+SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg"}
+ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+# ─────────────────────────────────────────────────────────────
+# Data classes
+# ─────────────────────────────────────────────────────────────
+
+@dataclass
+class ExtractionResult:
+    content_type: str   # "text" or "image"
+    content: str        # text string or base64 string
+    mime_type: str = "image/png"
+    method: str = ""    # "pymupdf", "tesseract", or "vision"
+
+
+@dataclass
+class ProcessResult:
+    original_name: str
+    final_name: str
+    status: str         # "renamed", "needs_review", "skipped", "error"
+    client: str = ""
+    description: str = ""
+    confidence: str = ""
+    error_message: Optional[str] = None
+    renamed_at: Optional[str] = None
+    extraction_method: str = ""
+    # Audit fields — filled in by employee after processing
+    audit_correct: bool = False
+    audit_wrong_client: bool = False
+    audit_bad_description: bool = False
+    audit_failed_client: bool = False
+    audit_should_review: bool = False
+    audit_corrected_name: str = ""  # what the employee said it should be named
+    # File mode
+    moved_to: str = ""              # destination path after a successful move
+    pending_dest: str = ""          # destination staged via "Apply to Selected", not yet moved
+
+
+# ─────────────────────────────────────────────────────────────
+# ConfigManager
+# ─────────────────────────────────────────────────────────────
+
+class ConfigManager:
+    def __init__(self):
+        self.config = self._load()
+
+    def _load(self) -> dict:
+        if not os.path.exists(CONFIG_PATH):
+            self._write(DEFAULT_CONFIG)
+            return self._deep_copy(DEFAULT_CONFIG)
+        try:
+            with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            merged = self._deep_copy(DEFAULT_CONFIG)
+            merged["paths"].update(data.get("paths", {}))
+            merged["api"].update(data.get("api", {}))
+            merged["processing"].update(data.get("processing", {}))
+            merged["reports"].update(data.get("reports", {}))
+            return merged
+        except Exception as e:
+            logging.warning(f"Could not load config.json: {e}. Using defaults.")
+            return self._deep_copy(DEFAULT_CONFIG)
+
+    def save(self, data: dict = None):
+        if data is None:
+            data = self.config
+        self._write(data)
+        self.config = data
+
+    def _write(self, data: dict):
+        tmp = CONFIG_PATH + ".tmp"
+        try:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            os.replace(tmp, CONFIG_PATH)
+        except Exception as e:
+            logging.error(f"Failed to write config: {e}")
+            raise
+
+    def validate(self) -> list:
+        errors = []
+        scandocs = self.config["paths"].get("scandocs_folder", "")
+        if not scandocs:
+            errors.append("Scandocs folder is not configured.")
+        elif not os.path.isdir(scandocs):
+            errors.append(f"Scandocs folder not found:\n  {scandocs}")
+        client_file = self.config["paths"].get("client_list_file", "")
+        if not client_file:
+            errors.append("Client list file path is not configured.")
+        return errors
+
+    @staticmethod
+    def _deep_copy(d: dict) -> dict:
+        return json.loads(json.dumps(d))
+
+
+# ─────────────────────────────────────────────────────────────
+# ClientListManager
+# ─────────────────────────────────────────────────────────────
+
+class ClientListManager:
+
+    @staticmethod
+    def load(path: str) -> list:
+        """Load client list and automatically add space-variant for any hyphenated names.
+        e.g. 'GARCIA-TELLEZ, Miguel' also registers as 'GARCIA TELLEZ, Miguel' internally
+        so OCR output (which often drops hyphens) still fuzzy-matches correctly."""
+        if not path or not os.path.isfile(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                names = [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.startswith("#")
+                ]
+            # Add space-variants for hyphenated names (kept in order, deduped)
+            result = []
+            seen = set()
+            for name in names:
+                if name not in seen:
+                    result.append(name)
+                    seen.add(name)
+                if '-' in name:
+                    variant = name.replace('-', ' ')
+                    if variant not in seen:
+                        result.append(variant)
+                        seen.add(variant)
+            return result
+        except Exception as e:
+            logging.error(f"Could not load client list from {path}: {e}")
+            return []
+
+    @staticmethod
+    def save(path: str, clients: list):
+        with open(path, "w", encoding="utf-8") as f:
+            for name in sorted(set(clients)):
+                f.write(name + "\n")
+
+    @staticmethod
+    def _invert_name(name: str) -> str:
+        """Try to convert 'First Last' → 'LAST, First' for matching.
+        If the name already contains a comma, returns it unchanged."""
+        if ',' in name:
+            return name
+        parts = name.strip().split()
+        if len(parts) >= 2:
+            last = parts[-1].upper()
+            first = ' '.join(parts[:-1])
+            return f"{last}, {first}"
+        return name
+
+    @staticmethod
+    def _normalize(name: str) -> str:
+        """Lowercase and replace hyphens with spaces for comparison.
+        Allows 'Garcia-Tellez' to match 'GARCIA TELLEZ' and vice versa."""
+        return name.lower().replace('-', ' ')
+
+    @staticmethod
+    def _all_inversions(name: str) -> list:
+        """Generate all possible LAST, First splits for a multi-word name.
+        e.g. "Julio Solano Trujillo" →
+             ["TRUJILLO, Julio Solano",   ← standard (last word = last name)
+              "SOLANO TRUJILLO, Julio"]   ← two-word last name
+        Only adds extra splits for 3+ word names; single-last-word is always first.
+        Excludes splits where first-name portion would be empty."""
+        if ',' in name:
+            return [name]   # already in LAST, First form
+        parts = name.strip().split()
+        if len(parts) < 2:
+            return [name]
+        results = []
+        # Try each split point from right to left (most common last-name first)
+        for split in range(len(parts) - 1, 0, -1):
+            last  = ' '.join(parts[split:]).upper()
+            first = ' '.join(parts[:split])
+            results.append(f"{last}, {first}")
+        return results
+
+    @staticmethod
+    def fuzzy_match(candidate: str, client_list: list, threshold: float = 0.82) -> Optional[str]:
+        if not candidate or not client_list:
+            return None
+        candidate = candidate.strip().strip(".,;:'\"").strip()
+
+        # Build normalized index (lowercase + hyphens→spaces)
+        norm_list = [ClientListManager._normalize(e) for e in client_list]
+
+        # 1. Exact match after normalization — always preferred
+        candidate_norm = ClientListManager._normalize(candidate)
+        for i, entry_norm in enumerate(norm_list):
+            if entry_norm == candidate_norm:
+                return client_list[i]
+
+        # 2. Try all inversion forms — standard split first, then multi-word last names.
+        inversions = ClientListManager._all_inversions(candidate)
+
+        # Also generate truncated-last-name forms:
+        # "SOLANO TRUJILLO, Julio" → also try "SOLANO, Julio"
+        # This handles AI returning 3-word names where only one surname is in the list.
+        truncated = set()
+        for inv in inversions:
+            if ',' in inv:
+                last_part, first_part = inv.split(',', 1)
+                last_words = last_part.strip().split()
+                if len(last_words) > 1:
+                    truncated.add(f"{last_words[0]}, {first_part.strip()}")
+
+        for inv in list(inversions) + list(truncated):
+            inv_norm = ClientListManager._normalize(inv)
+            if inv_norm == candidate_norm:
+                continue
+            for i, entry_norm in enumerate(norm_list):
+                if entry_norm == inv_norm:
+                    return client_list[i]   # exact match on this inversion
+
+        # 3. Fuzzy match — score all inversion forms including truncated, keep best
+        all_forms = {candidate_norm} | {
+            ClientListManager._normalize(inv) for inv in list(inversions) + list(truncated)
+        }
+        best_entry = None
+        best_score = 0.0
+        for form in all_forms:
+            for i, entry_norm in enumerate(norm_list):
+                score = difflib.SequenceMatcher(None, form, entry_norm).ratio()
+                if score > best_score:
+                    best_score = score
+                    best_entry = client_list[i]
+
+        if best_entry and best_score >= threshold:
+            return best_entry
+
+        # 4. Compound surname prefix match — handles OCR merging like
+        #    "Delgadillocuellar" where OCR drops the space between two last names.
+        #    Extract the last-name portion of the candidate (before comma, or last word).
+        if ',' in candidate:
+            cand_last = candidate.split(',')[0].strip()
+        else:
+            parts = candidate.strip().split()
+            cand_last = parts[-1] if parts else candidate
+        cand_last_norm = ClientListManager._normalize(cand_last)
+
+        # cand_last must be strictly longer than the entry's last name — otherwise
+        # this is just a plain last-name match, not a merged compound surname.
+        if len(cand_last_norm) >= 7:
+            # Extract candidate's first name for cross-checking
+            if ',' in candidate:
+                cand_first_norm = ClientListManager._normalize(candidate.split(',')[1].strip())
+            else:
+                parts = candidate.strip().split()
+                cand_first_norm = ClientListManager._normalize(parts[0]) if len(parts) > 1 else ""
+
+            prefix_matches = []
+            for i, entry in enumerate(client_list):
+                entry_last = ClientListManager._normalize(
+                    entry.split(',')[0].strip() if ',' in entry else entry.split()[-1]
+                )
+                # Require cand_last is longer (genuinely merged surname, not same last name)
+                if len(entry_last) >= 6 and len(cand_last_norm) > len(entry_last) and cand_last_norm.startswith(entry_last):
+                    # Cross-check first name if we have one
+                    if cand_first_norm:
+                        entry_first_norm = ClientListManager._normalize(
+                            entry.split(',')[1].strip() if ',' in entry else ""
+                        )
+                        # First names must share a common start (handles abbreviations/nicknames)
+                        if entry_first_norm and not (
+                            entry_first_norm.startswith(cand_first_norm) or
+                            cand_first_norm.startswith(entry_first_norm)
+                        ):
+                            continue  # First name mismatch — skip
+                    prefix_matches.append(i)
+
+            # Only act when exactly one client matches — ambiguity → NEEDS_REVIEW
+            if len(prefix_matches) == 1:
+                logging.info(
+                    f"fuzzy_match: prefix match '{cand_last_norm}' → "
+                    f"'{client_list[prefix_matches[0]]}'"
+                )
+                return client_list[prefix_matches[0]]
+
+        return None
+
+    @staticmethod
+    def is_valid_format(name: str) -> bool:
+        """Accepts 'LAST, First' or 'LAST, First Middle' etc."""
+        return bool(re.match(r"^[A-Za-z\-\'\. ]+,\s+[A-Za-z\-\'\. ]+$", name.strip()))
+
+    @staticmethod
+    def filter_candidates(doc_text: str, client_list: list, top_n: int = 10) -> list:
+        """Pre-filter the client list to the top_n most likely candidates.
+
+        Strategy: only extract text from labeled keyword regions (Client:, RE:,
+        Insured:, etc.) — NOT the full document.  Using the full document caused
+        the original anchoring failure (facility name 'Velazquez Pain Summerlin'
+        → model picked VELAZQUEZ, Aida).  Restricting to labeled regions gives a
+        clean signal of who the document is actually about.
+
+        Falls back to the full list when no labeled regions are found.
+        """
+        if not doc_text or not client_list:
+            return client_list
+
+        # ── Step 1: extract text near labeled keywords only ───────────────────
+        # Each pattern captures up to ~60 chars after the label.
+        _label_re = re.compile(
+            r"(?:Client(?:\s*/\s*Patient)?(?:\s+Name)?|Claimant|Clmt|Injured(?:\s+(?:Worker|Party))?|"
+            r"Patient(?:\s+Name)?|Insured(?:\s+Name)?|Named\s+Insured|Employee|"
+            r"RE|Re|Regarding|Subject)\s*[:\-\.]\s*"
+            r"([A-Za-z][A-Za-z ,\-\'\.]{1,60})",
+            re.IGNORECASE,
+        )
+        labeled_phrases = [m.group(1).strip() for m in _label_re.finditer(doc_text)]
+
+        # ── Step 2: score every client against the labeled phrases ────────────
+        if labeled_phrases:
+            scored: list = []
+            for client in client_list:
+                client_lower = client.lower()
+                last_name = client.split(",")[0].strip().lower()
+                best = 0.0
+                for phrase in labeled_phrases:
+                    phrase_lower = phrase.lower()
+                    # Exact last-name hit in the phrase → strong signal
+                    if len(last_name) >= 3 and last_name in phrase_lower:
+                        best = max(best, 0.90)
+                        continue
+                    ratio = difflib.SequenceMatcher(None, phrase_lower, client_lower).ratio()
+                    if ratio > best:
+                        best = ratio
+                scored.append((best, client))
+
+            scored.sort(key=lambda x: x[0], reverse=True)
+            top_score = scored[0][0] if scored else 0.0
+
+            if top_score >= 0.50:
+                short_list = [name for _score, name in scored[:top_n]]
+                logging.info(
+                    f"filter_candidates: {len(client_list)} → {len(short_list)} candidates "
+                    f"(top score {top_score:.2f}, phrases: {labeled_phrases})"
+                )
+                return short_list
+
+        # No labeled regions found or no strong score → fall back to full list
+        logging.info(
+            f"filter_candidates: no labeled keyword regions found, using full list "
+            f"({len(client_list)} clients)"
+        )
+        return client_list
+
+
+# ─────────────────────────────────────────────────────────────
+# DocumentExtractor
+# ─────────────────────────────────────────────────────────────
+
+class DocumentExtractor:
+    """
+    Extracts content from a document for AI classification.
+    Returns an ExtractionResult with content_type="text" or "image".
+    """
+
+    IMAGE_RENDER_SCALE = 300 / 72  # ~4.17x — renders at 300 DPI for better OCR accuracy
+
+    @staticmethod
+    def extract(file_path: str, max_chars: int = 4000, max_pages: int = 5) -> ExtractionResult:
+        ext = os.path.splitext(file_path)[1].lower()
+        if ext == ".pdf":
+            return DocumentExtractor._from_pdf(file_path, max_chars, max_pages)
+        elif ext in (".jpg", ".jpeg"):
+            return DocumentExtractor._from_jpeg(file_path)
+        else:
+            raise ValueError(f"Unsupported file type: {ext}")
+
+    # Labels that reliably identify the client when they appear in document text
+    _CLIENT_LABEL_RE = re.compile(
+        r"(?:Client(?:\s*/\s*Patient)?(?:\s+Name)?|Claimant|Clmt|"
+        r"Injured(?:\s+(?:Worker|Party))?|Patient(?:\s+Name)?|"
+        r"Insured(?:\s+Name)?|Named\s+Insured|Employee|"
+        r"Your\s+Client|RE|Re|Regarding|Subject)\s*[:\-\.]\s*"
+        r"([A-Za-z][A-Za-z ,\-\'\.]{1,60})",
+        re.IGNORECASE,
+    )
+
+    # Words that signal the end of a name (stop words for phrase truncation)
+    _NAME_STOP_RE = re.compile(
+        r"\b(?:Law|Office|Attorney|Atty|DOB|Date|vs?\.?|and|LLC|Inc|"
+        r"Insurance|Clinic|Hospital|Medical|Center|Corp|PC|LLP|PA)\b",
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _extract_labeled_snippets(page_text: str) -> list:
+        """Extract name phrases following client-identifying labels on a page.
+        Truncates each phrase at stop words so surrounding text doesn't bleed in."""
+        snippets = []
+        for m in DocumentExtractor._CLIENT_LABEL_RE.finditer(page_text):
+            phrase = m.group(1).strip()
+            # Truncate at stop words
+            stop = DocumentExtractor._NAME_STOP_RE.search(phrase)
+            if stop:
+                phrase = phrase[:stop.start()].strip()
+            phrase = phrase.strip(".,;: ")
+            if len(phrase) >= 3:
+                snippets.append(phrase)
+        return snippets
+
+    @staticmethod
+    def _from_pdf(file_path: str, max_chars: int, max_pages: int = 5) -> ExtractionResult:
+        if fitz is None:
+            raise ImportError("PyMuPDF is not installed. Run: pip install PyMuPDF")
+        doc = fitz.open(file_path)
+        page_limit = min(doc.page_count, max_pages)
+        if doc.page_count > max_pages:
+            logging.info(
+                f"{os.path.basename(file_path)}: {doc.page_count} pages — "
+                f"capping at {max_pages}"
+            )
+
+        # ── Pass 1: collect per-page text via PyMuPDF ─────────────────────
+        page_texts = []
+        all_native_text = ""
+        for page in doc.pages(0, page_limit):
+            pt = page.get_text("text").strip()
+            page_texts.append(pt)
+            all_native_text += pt
+
+        has_native_text = len(all_native_text.strip()) >= 50
+
+        if has_native_text:
+            # ── Pass 2: find pages containing client-identifying labels ────
+            labeled_pages = []
+            unlabeled_pages = []
+            for i, pt in enumerate(page_texts):
+                snippets = DocumentExtractor._extract_labeled_snippets(pt)
+                if snippets:
+                    labeled_pages.append((i, pt, snippets))
+                else:
+                    unlabeled_pages.append((i, pt))
+
+            if labeled_pages:
+                # Build content: labeled pages first (with snippet annotation),
+                # then remaining pages up to the char budget.
+                parts = []
+                for i, pt, snippets in labeled_pages:
+                    parts.append(f"[Page {i+1} — labeled fields: {'; '.join(snippets)}]\n{pt}")
+                for i, pt in unlabeled_pages:
+                    parts.append(f"[Page {i+1}]\n{pt}")
+                raw_text = "\n\n".join(parts).strip()[:max_chars]
+                logging.info(
+                    f"{os.path.basename(file_path)}: labeled pages found "
+                    f"({[i+1 for i,_,_ in labeled_pages]}), sending those first"
+                )
+            else:
+                # No labeled pages — send all pages sequentially
+                raw_text = all_native_text.strip()[:max_chars]
+
+            doc.close()
+            return ExtractionResult(content_type="text", content=raw_text, method="pymupdf")
+
+        # ── Image-only PDF: OCR every page up to limit, prioritize labeled ──
+        doc.close()
+        ocr_labeled = []
+        ocr_unlabeled = []
+        for i in range(page_limit):
+            ocr_text = DocumentExtractor._ocr_pdf_page(file_path, page_index=i,
+                                                        max_chars=max_chars)
+            if not ocr_text:
+                continue
+            snippets = DocumentExtractor._extract_labeled_snippets(ocr_text)
+            if snippets:
+                ocr_labeled.append((i, ocr_text, snippets))
+            else:
+                ocr_unlabeled.append((i, ocr_text))
+
+        if ocr_labeled or ocr_unlabeled:
+            parts = []
+            for i, txt, snippets in ocr_labeled:
+                parts.append(f"[Page {i+1} — labeled fields: {'; '.join(snippets)}]\n{txt}")
+            for i, txt in ocr_unlabeled:
+                parts.append(f"[Page {i+1}]\n{txt}")
+            combined = "\n\n".join(parts).strip()[:max_chars]
+            logging.info(
+                f"OCR succeeded on {file_path} ({len(combined)} chars, "
+                f"labeled pages: {[i+1 for i,_,_ in ocr_labeled]})"
+            )
+            return ExtractionResult(content_type="text", content=combined, method="tesseract")
+
+        # Last resort: send page 1 as image to vision model
+        return DocumentExtractor._render_pdf_page(file_path)
+
+    @staticmethod
+    def _ocr_pdf_page(file_path: str, page_index: int, max_chars: int) -> str:
+        """Run Tesseract OCR on a single PDF page rendered to an image.
+        Returns extracted text if >= 50 characters were found, otherwise empty string.
+        Returns empty string silently on any error so the caller can fall back gracefully."""
+        if pytesseract is None or PILImage is None:
+            return ""
+        try:
+            doc = fitz.open(file_path)
+            page_index = min(page_index, doc.page_count - 1)
+            pix = doc[page_index].get_pixmap(
+                matrix=fitz.Matrix(DocumentExtractor.IMAGE_RENDER_SCALE,
+                                   DocumentExtractor.IMAGE_RENDER_SCALE)
+            )
+            doc.close()
+            import io
+            pil = PILImage.open(io.BytesIO(pix.tobytes("png")))
+            text = pytesseract.image_to_string(pil).strip()
+            return text[:max_chars] if len(text) >= 50 else ""
+        except Exception as e:
+            logging.warning(f"OCR failed on {file_path} page {page_index}: {e}")
+            return ""
+
+    @staticmethod
+    def _render_pdf_page(file_path: str) -> ExtractionResult:
+        if fitz is None:
+            raise ImportError("PyMuPDF is not installed.")
+        doc = fitz.open(file_path)
+        page = doc[0]
+        scale = DocumentExtractor.IMAGE_RENDER_SCALE
+        mat = fitz.Matrix(scale, scale)
+        pix = page.get_pixmap(matrix=mat)
+        img_bytes = pix.tobytes("png")
+        doc.close()
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        return ExtractionResult(content_type="image", content=b64, mime_type="image/png", method="vision")
+
+    @staticmethod
+    def _from_jpeg(file_path: str) -> ExtractionResult:
+        with open(file_path, "rb") as f:
+            img_bytes = f.read()
+        b64 = base64.b64encode(img_bytes).decode("utf-8")
+        return ExtractionResult(content_type="image", content=b64, mime_type="image/jpeg", method="vision")
+
+
+# ─────────────────────────────────────────────────────────────
+# APIClient
+# ─────────────────────────────────────────────────────────────
+
+class APIClient:
+
+    @staticmethod
+    def _build_prompt(extraction: ExtractionResult) -> str:
+        """Build the classification prompt. AI extracts the client name freely from
+        the document — no client list in the prompt. fuzzy_match (in FileProcessor)
+        maps the raw name to the authoritative list entry."""
+        if extraction.content_type == "text":
+            doc_section = f"Document text:\n{extraction.content}"
+        else:
+            doc_section = "[See attached image]"
+
+        return (
+            "You are a document classifier for a law firm.\n"
+            "Your job is to identify which client this document belongs to "
+            "and write a short description of what it is.\n\n"
+            f"{doc_section}\n\n"
+            "RULES — read carefully before responding:\n\n"
+            "CLIENT IDENTIFICATION:\n"
+            "- Scan the document for labels that introduce the client's name, "
+            "in this priority order:\n"
+            "    1. 'Client:', 'Client Name:', 'Client/Patient Name:'\n"
+            "    2. 'Claimant:', 'Injured:', 'Injured Party:', 'Injured Worker:'\n"
+            "    3. 'Patient:', 'Patient Name:'\n"
+            "    4. 'Insured:', 'Insured Name:', 'Named Insured:'\n"
+            "    5. 'Employee:' (workers comp)\n"
+            "    6. 'RE:', 'Re:', 'Regarding:', 'Subject:'\n"
+            "    7. Case captions (plaintiff or defendant the firm represents)\n"
+            "- Do NOT identify a business, facility, clinic, hospital, insurance "
+            "company, opposing party, or attorney as the client.\n"
+            "- Return the client's full name exactly as it appears in the document.\n"
+            "- If you cannot clearly identify the client, return NEEDS_REVIEW.\n\n"
+            "DESCRIPTION:\n"
+            "- 2-5 words, title case, no special characters "
+            "(e.g. \"Retainer Agreement\", \"Motion to Dismiss\", \"Invoice\").\n"
+            "- NEVER describe a fax cover sheet or fax wrapper — describe the actual "
+            "document content. If no real content is visible, use \"Incoming Document\".\n\n"
+            "Return ONLY valid JSON with no extra text:\n"
+            '{"client": "LAST, First", "desc": "Retainer Agreement", "confidence": "high|medium|low"}'
+        )
+
+    @staticmethod
+    def classify(extraction: ExtractionResult, client_list: list, config: dict) -> dict:
+        # No client list in the prompt — AI extracts the name freely from the document.
+        # fuzzy_match (called in FileProcessor) maps the raw name to the authoritative list.
+        prompt = APIClient._build_prompt(extraction)
+
+        if config.get("processing", {}).get("debug_log_prompt", False):
+            logging.info(f"[DEBUG PROMPT]\n{prompt}\n[END PROMPT]")
+
+        api_cfg = config["api"]
+        errors = []
+
+        # Try OpenWebUI (OpenAI-compatible)
+        try:
+            raw = APIClient._call_openwebui(prompt, extraction, api_cfg)
+            return APIClient._parse_response(raw)
+        except Exception as e:
+            errors.append(f"OpenWebUI: {e}")
+            logging.warning(f"OpenWebUI API call failed: {e}")
+
+        # Fallback: direct Ollama
+        try:
+            raw = APIClient._call_ollama(prompt, extraction, api_cfg)
+            return APIClient._parse_response(raw)
+        except Exception as e:
+            errors.append(f"Ollama: {e}")
+            logging.error(f"Ollama fallback also failed: {e}")
+
+        raise ConnectionError("Both API endpoints failed.\n" + "\n".join(errors))
+
+    @staticmethod
+    def _call_openwebui(prompt: str, extraction: ExtractionResult, api_cfg: dict) -> str:
+        url = api_cfg["openwebui_url"].rstrip("/") + "/api/chat/completions"
+        headers = {"Content-Type": "application/json"}
+        if api_cfg.get("api_key"):
+            headers["Authorization"] = f"Bearer {api_cfg['api_key']}"
+
+        if extraction.content_type == "image":
+            # OpenAI vision format: content is an array
+            content_parts = [
+                {"type": "text", "text": prompt.replace("[See attached image]", "").strip()},
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{extraction.mime_type};base64,{extraction.content}"
+                    },
+                },
+            ]
+            messages = [{"role": "user", "content": content_parts}]
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
+        payload = {
+            "model": api_cfg["model"],
+            "messages": messages,
+            "stream": False,
+        }
+        resp = requests.post(
+            url, json=payload, headers=headers,
+            timeout=(api_cfg["timeout_connect"], api_cfg["timeout_read"])
+        )
+        resp.raise_for_status()
+        return resp.json()["choices"][0]["message"]["content"]
+
+    @staticmethod
+    def _call_ollama(prompt: str, extraction: ExtractionResult, api_cfg: dict) -> str:
+        url = api_cfg["ollama_url"].rstrip("/") + "/api/generate"
+        payload = {
+            "model": api_cfg["model"],
+            "prompt": prompt,
+            "format": "json",
+            "stream": False,
+        }
+        if extraction.content_type == "image":
+            payload["images"] = [extraction.content]
+
+        resp = requests.post(
+            url, json=payload,
+            timeout=(api_cfg["timeout_connect"], api_cfg["timeout_read"])
+        )
+        resp.raise_for_status()
+        return resp.json().get("response", "")
+
+    @staticmethod
+    def _parse_response(raw: str) -> dict:
+        # Try direct parse
+        try:
+            data = json.loads(raw)
+            if isinstance(data, dict) and "client" in data:
+                return data
+        except json.JSONDecodeError:
+            pass
+        # Extract first JSON object via regex
+        match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
+        if match:
+            try:
+                data = json.loads(match.group())
+                if isinstance(data, dict):
+                    return data
+            except json.JSONDecodeError:
+                pass
+        logging.warning(f"Could not parse API response as JSON. Raw: {raw[:300]}")
+        return {"client": "A-NEEDS REVIEW", "desc": "Unknown Document", "confidence": "low"}
+
+    @staticmethod
+    def test_connection(config: dict) -> tuple:
+        api_cfg = config["api"]
+        # Try OpenWebUI
+        try:
+            url = api_cfg["openwebui_url"].rstrip("/") + "/api/chat/completions"
+            headers = {"Content-Type": "application/json"}
+            if api_cfg.get("api_key"):
+                headers["Authorization"] = f"Bearer {api_cfg['api_key']}"
+            payload = {
+                "model": api_cfg["model"],
+                "messages": [{"role": "user", "content": "Reply with just the word: ready"}],
+                "stream": False,
+            }
+            resp = requests.post(url, json=payload, headers=headers,
+                                 timeout=(api_cfg["timeout_connect"], 30))
+            resp.raise_for_status()
+            return True, f"Connected via OpenWebUI  ({api_cfg['model']})"
+        except Exception as e1:
+            pass
+        # Try Ollama direct
+        try:
+            url = api_cfg["ollama_url"].rstrip("/") + "/api/generate"
+            payload = {
+                "model": api_cfg["model"],
+                "prompt": "Reply with just the word: ready",
+                "stream": False,
+            }
+            resp = requests.post(url, json=payload,
+                                 timeout=(api_cfg["timeout_connect"], 30))
+            resp.raise_for_status()
+            return True, f"Connected via Ollama direct  ({api_cfg['model']})"
+        except Exception as e2:
+            return False, f"Could not connect.\nOpenWebUI: {e1}\nOllama: {e2}"
+
+
+# ─────────────────────────────────────────────────────────────
+# FileProcessor
+# ─────────────────────────────────────────────────────────────
+
+class FileProcessor:
+
+    @staticmethod
+    def process_file(file_path: str, config: dict, client_list: list) -> ProcessResult:
+        filename = os.path.basename(file_path)
+        ext = os.path.splitext(filename)[1].lower()
+        proc_cfg = config["processing"]
+
+        # Skip already-processed files
+        if proc_cfg.get("skip_already_processed") and \
+                FileProcessor._already_processed(filename, client_list):
+            return ProcessResult(
+                original_name=filename,
+                final_name=filename,
+                status="skipped",
+            )
+
+        try:
+            if not os.path.isfile(file_path):
+                raise FileNotFoundError(f"File not found: {file_path}")
+            if os.path.getsize(file_path) == 0:
+                raise ValueError("File is empty (0 bytes)")
+
+            # Extract content
+            extraction = DocumentExtractor.extract(
+                file_path,
+                proc_cfg["max_ocr_chars"],
+                proc_cfg.get("max_pages", 5),
+            )
+
+            # Classify via AI
+            result = APIClient.classify(extraction, client_list, config)
+            raw_client = result.get("client", "NEEDS_REVIEW").strip().strip("\"'")
+            raw_desc = result.get("desc", "Unknown Document")
+            confidence = result.get("confidence", "low")
+
+            # Log what the AI returned so failures are easy to diagnose
+            logging.info(f"{filename}: AI returned client='{raw_client}' confidence={confidence}")
+
+            # Confidence gate — configurable in Settings.
+            # require_high_confidence=True (default): only "high" proceeds to rename.
+            # require_high_confidence=False: "medium" also proceeds (more matches, more risk).
+            # "low" always goes to NEEDS_REVIEW regardless of this setting.
+            require_high = proc_cfg.get("require_high_confidence", True)
+            _confidence_ok = (
+                confidence == "high"
+                or (confidence == "medium" and not require_high)
+            )
+            _skip_fuzzy = (
+                raw_client in ("NEEDS_REVIEW", "A-NEEDS REVIEW", "")
+                or not _confidence_ok
+            )
+            if not _confidence_ok and raw_client not in ("NEEDS_REVIEW", "A-NEEDS REVIEW", ""):
+                logging.info(
+                    f"{filename}: confidence={confidence} "
+                    f"({'below high threshold' if require_high else 'low'}) "
+                    "— sending to NEEDS_REVIEW without matching"
+                )
+
+            threshold = proc_cfg.get("fuzzy_threshold", 0.82)
+            matched = None if _skip_fuzzy else \
+                ClientListManager.fuzzy_match(raw_client, client_list, threshold)
+
+            if matched:
+                logging.info(f"{filename}: fuzzy matched '{raw_client}' → '{matched}'")
+
+            if matched:
+                final_client = matched
+                status = "renamed"
+            else:
+                final_client = "A-NEEDS REVIEW"
+                status = "needs_review"
+
+            safe_desc = FileProcessor._safe_subject(raw_desc) or "Document"
+
+            # Safety net: if the description is still fax-related despite the prompt rule,
+            # substitute a neutral fallback rather than letting it become the filename.
+            if FileProcessor._desc_is_fax(safe_desc):
+                logging.info(
+                    f"{filename}: AI returned fax-related desc '{safe_desc}' — "
+                    "substituting 'Incoming Document'"
+                )
+                safe_desc = "Incoming Document"
+
+            new_name = f"{final_client} - {safe_desc}{ext}"
+
+            # Collision avoidance
+            dest_dir = os.path.dirname(file_path)
+            new_name = FileProcessor._resolve_collision(dest_dir, new_name, filename)
+
+            renamed_at = None
+            if new_name != filename:
+                os.rename(file_path, os.path.join(dest_dir, new_name))
+                renamed_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+            return ProcessResult(
+                original_name=filename,
+                final_name=new_name,
+                status=status,
+                client=final_client,
+                description=safe_desc,
+                confidence=confidence,
+                renamed_at=renamed_at,
+                extraction_method=extraction.method,
+            )
+
+        except Exception as e:
+            logging.error(f"Error processing {filename}: {e}", exc_info=True)
+            return ProcessResult(
+                original_name=filename,
+                final_name=filename,
+                status="error",
+                error_message=str(e),
+            )
+
+    # Phrases that indicate the AI described the fax wrapper rather than the real document
+    _FAX_DESC_PATTERNS = [
+        "fax", "facsimile", "telecopy", "send result", "transmission report",
+        "activity report", "communication journal",
+    ]
+
+    @staticmethod
+    def _desc_is_fax(desc: str) -> bool:
+        lower = desc.lower()
+        return any(p in lower for p in FileProcessor._FAX_DESC_PATTERNS)
+
+    @staticmethod
+    def _safe_subject(text: str) -> str:
+        text = ILLEGAL_CHARS_RE.sub("", text)
+        text = re.sub(r"\s+", " ", text).strip()
+        return text.title()
+
+    @staticmethod
+    def _resolve_collision(directory: str, filename: str, source_name: str) -> str:
+        """If `filename` already exists in `directory` (and isn't the source file),
+        append (1), (2), … until a free name is found."""
+        if filename == source_name:
+            return filename
+        if not os.path.exists(os.path.join(directory, filename)):
+            return filename
+        base, ext = os.path.splitext(filename)
+        counter = 1
+        while True:
+            candidate = f"{base} ({counter}){ext}"
+            if not os.path.exists(os.path.join(directory, candidate)):
+                return candidate
+            counter += 1
+
+    @staticmethod
+    def _already_processed(filename: str, client_list: list) -> bool:
+        """True if the file already looks like 'LAST, First - Subject.ext'
+        with a recognised client name at the front."""
+        if filename.startswith("A-NEEDS REVIEW"):
+            return False
+        match = re.match(r"^(.+?) - .+\.(pdf|jpg|jpeg)$", filename, re.IGNORECASE)
+        if not match:
+            return False
+        name_part = match.group(1)
+        return ClientListManager.fuzzy_match(name_part, client_list, threshold=0.90) is not None
+
+
+# ─────────────────────────────────────────────────────────────
+# ProcessingEngine  (runs in a background thread)
+# ─────────────────────────────────────────────────────────────
+
+class ProcessingEngine:
+    def __init__(self):
+        self._stop_event = threading.Event()
+
+    def stop(self):
+        self._stop_event.set()
+
+    def run_batch(self, config: dict, result_queue: queue.Queue):
+        self._stop_event.clear()
+        scandocs = config["paths"]["scandocs_folder"]
+        client_list_path = config["paths"]["client_list_file"]
+
+        try:
+            client_list = ClientListManager.load(client_list_path)
+            if not client_list:
+                result_queue.put({
+                    "type": "error",
+                    "message": (
+                        "The client list is empty.\n\n"
+                        "Go to the Client List tab, add your clients, and save."
+                    ),
+                })
+                result_queue.put({"type": "done"})
+                return
+
+            try:
+                all_entries = os.listdir(scandocs)
+            except Exception as e:
+                result_queue.put({
+                    "type": "error",
+                    "message": f"Cannot read scandocs folder:\n{e}",
+                })
+                result_queue.put({"type": "done"})
+                return
+
+            files = [
+                f for f in all_entries
+                if os.path.isfile(os.path.join(scandocs, f))
+                and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+            ]
+
+            if not files:
+                result_queue.put({
+                    "type": "error",
+                    "message": "No PDF or JPG files found in the scandocs folder.",
+                })
+                result_queue.put({"type": "done"})
+                return
+
+            result_queue.put({"type": "total", "count": len(files)})
+
+            for i, filename in enumerate(files):
+                if self._stop_event.is_set():
+                    result_queue.put({"type": "stopped"})
+                    break
+                result_queue.put({
+                    "type": "progress",
+                    "current": i + 1,
+                    "filename": filename,
+                })
+                result = FileProcessor.process_file(
+                    os.path.join(scandocs, filename), config, client_list
+                )
+                result_queue.put({"type": "result", "result": result})
+
+        except Exception as e:
+            logging.error(f"Unhandled batch error: {e}", exc_info=True)
+            result_queue.put({"type": "error", "message": str(e)})
+        finally:
+            result_queue.put({"type": "done"})
+
+
+# ─────────────────────────────────────────────────────────────
+# SplashScreen
+# ─────────────────────────────────────────────────────────────
+
+class SplashScreen:
+    """Fun splash window shown while the main app initialises.
+    Shows the logo, an animated spinner, and a stream of dad jokes."""
+
+    DAD_JOKES = [
+        ("Why don't scientists trust atoms?",
+         "Because they make up everything!"),
+        ("I told my wife she was drawing her eyebrows too high.",
+         "She looked surprised."),
+        ("I'm reading a book about anti-gravity.",
+         "It's impossible to put down!"),
+        ("Did you hear about the claustrophobic astronaut?",
+         "He just needed a little space."),
+        ("Why don't eggs tell jokes?",
+         "They'd crack each other up!"),
+        ("I asked the librarian if they had books about paranoia.",
+         "She whispered: 'They're right behind you!'"),
+        ("What do you call a fish without eyes?",
+         "A fsh."),
+        ("Why can't a leopard hide?",
+         "Because he's always spotted!"),
+        ("I used to hate facial hair…",
+         "…but then it grew on me."),
+        ("What do you call a factory that makes okay products?",
+         "A satisfactory."),
+    ]
+
+    def __init__(self, parent: tk.Misc, on_done, primary_color: str = "#1565c0",
+                 show_duration_ms: int = 7500):
+        self._on_done = on_done
+        self._primary = primary_color
+        import random as _random
+        self._joke_idx = _random.randint(0, len(self.DAD_JOKES) - 1)
+        self._spinner_angle = 0
+        self._dot_count = 0
+        self._done_called = False
+
+        self.win = tk.Toplevel(parent)
+        self.win.overrideredirect(True)
+        self.win.resizable(False, False)
+        self.win.configure(bg="#ffffff")
+
+        W, H = 520, 360
+        sw = self.win.winfo_screenwidth()
+        sh = self.win.winfo_screenheight()
+        self.win.geometry(f"{W}x{H}+{(sw - W)//2}+{(sh - H)//2}")
+        self.win.lift()
+        self.win.attributes("-topmost", True)
+
+        # DWM rounded window corners (Windows 11)
+        try:
+            import ctypes
+            hwnd = self.win.winfo_id()
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd, 33, ctypes.byref(ctypes.c_int(2)), ctypes.sizeof(ctypes.c_int))
+        except Exception:
+            pass
+
+        self._build(W, H)
+        self._animate_spinner()
+        self.win.after(400, self._show_question)
+        self.win.after(show_duration_ms, self._finish)
+
+    # ── Layout ────────────────────────────────────────────────
+
+    def _build(self, W: int, H: int):
+        primary = self._primary
+
+        # Coloured top banner
+        banner = tk.Frame(self.win, bg=primary, height=8)
+        banner.pack(fill=tk.X, side=tk.TOP)
+
+        # Coloured bottom banner
+        tk.Frame(self.win, bg=primary, height=8).pack(fill=tk.X, side=tk.BOTTOM)
+
+        # Logo
+        self._logo_img = None
+        png_path = os.path.join(ASSETS_DIR, "Speedy Scandocs Logo.png")
+        if PILImage is not None and os.path.isfile(png_path):
+            try:
+                img = PILImage.open(png_path).convert("RGBA")
+                bbox = img.getbbox()
+                if bbox:
+                    img = img.crop(bbox)
+                target_h = 90
+                ratio = target_h / img.height
+                new_w = max(1, int(img.width * ratio))
+                img = img.resize((new_w, target_h), PILImage.LANCZOS)
+                bg_img = PILImage.new("RGB", (new_w, target_h), (255, 255, 255))
+                bg_img.paste(img, mask=img.split()[3])
+                self._logo_img = PILImageTk.PhotoImage(bg_img)
+            except Exception:
+                pass
+
+        if self._logo_img:
+            tk.Label(self.win, image=self._logo_img,
+                     bg="#ffffff", bd=0).place(relx=0.5, y=70, anchor="center")
+        else:
+            tk.Label(self.win, text="Speedy Scandocs", bg="#ffffff",
+                     fg=primary, font=("Segoe UI", 20, "bold")).place(
+                relx=0.5, y=70, anchor="center")
+
+        # Spinner canvas
+        self._spin_canvas = tk.Canvas(
+            self.win, width=46, height=46, bg="#ffffff", highlightthickness=0)
+        self._spin_canvas.place(relx=0.5, y=168, anchor="center")
+
+        # Joke label
+        self._joke_var = tk.StringVar(value="")
+        self._joke_lbl = tk.Label(
+            self.win, textvariable=self._joke_var, bg="#ffffff",
+            fg="#555555", font=("Segoe UI", 10, "italic"),
+            wraplength=460, justify="center",
+        )
+        self._joke_lbl.place(relx=0.5, y=240, anchor="center", width=480)
+
+        # Footer hint
+        tk.Label(self.win, text="Loading, please wait…", bg="#ffffff",
+                 fg="#bbbbbb", font=("Segoe UI", 8)).place(
+            relx=0.5, y=320, anchor="center")
+
+    # ── Spinner animation ─────────────────────────────────────
+
+    def _animate_spinner(self):
+        if not self.win.winfo_exists():
+            return
+        c = self._spin_canvas
+        c.delete("all")
+        a = self._spinner_angle
+        p = self._primary
+        c.create_arc(3, 3, 43, 43, start=a,       extent=270,
+                     style="arc", outline=p,       width=5)
+        c.create_arc(3, 3, 43, 43, start=a + 270, extent=90,
+                     style="arc", outline="#dddddd", width=5)
+        self._spinner_angle = (self._spinner_angle + 14) % 360
+        self.win.after(40, self._animate_spinner)
+
+    # ── Dad joke cycle ────────────────────────────────────────
+
+    def _show_question(self):
+        if not self.win.winfo_exists():
+            return
+        joke = self.DAD_JOKES[self._joke_idx % len(self.DAD_JOKES)]
+        self._joke_var.set(f"{joke[0]}")
+        self._dot_count = 0
+        self.win.after(2200, self._animate_dots)
+
+    def _animate_dots(self):
+        if not self.win.winfo_exists():
+            return
+        dots = "  .  " * ((self._dot_count % 3) + 1)
+        self._joke_var.set(dots)
+        self._dot_count += 1
+        if self._dot_count <= 5:
+            self.win.after(350, self._animate_dots)
+        else:
+            self.win.after(200, self._show_answer)
+
+    def _show_answer(self):
+        if not self.win.winfo_exists():
+            return
+        joke = self.DAD_JOKES[self._joke_idx % len(self.DAD_JOKES)]
+        self._joke_var.set(f"{joke[1]}")
+        self._joke_idx += 1
+        self.win.after(2600, self._show_question)
+
+    # ── Close ─────────────────────────────────────────────────
+
+    def _finish(self):
+        if self._done_called:
+            return
+        self._done_called = True
+        try:
+            if self.win.winfo_exists():
+                self.win.destroy()
+        except Exception:
+            pass
+        try:
+            self._on_done()
+        except Exception as exc:
+            logging.warning(f"SplashScreen on_done error: {exc}")
+
+
+# ─────────────────────────────────────────────────────────────
+# ScandocsApp  (tkinter GUI)
+# ─────────────────────────────────────────────────────────────
+
+class ScandocsApp(ttk.Window):
+
+    def __init__(self):
+        super().__init__(themename="litera")
+        self.withdraw()               # hidden until splash finishes
+        self.title("Speedy Scandocs")
+        self.geometry("1500x1000")
+        self.minsize(1100, 800)
+
+        self.config_mgr = ConfigManager()
+        self.engine = ProcessingEngine()
+        self._queue: queue.Queue = queue.Queue()
+        self._results: list = []
+        self._total_files: int = 0
+        self._iid_to_result: dict = {}   # treeview item id → ProcessResult
+        self._audit_updating: bool = False  # prevent recursive checkbox callbacks
+        self.fo_dest_var = tk.StringVar()        # file-mode destination folder
+        self.s_file_mode_auto_var      = tk.BooleanVar(value=True)
+        self.s_file_mode_manual_var    = tk.BooleanVar(value=True)
+        self.s_suggest_loc_var         = tk.BooleanVar(value=False)
+        self.s_suggest_parent_var      = tk.StringVar(value="")
+        self.s_require_high_conf_var   = tk.BooleanVar(value=True)
+        self._all_clients: list = []        # full client list for combo filtering
+        self._review_selected_file: str = ""  # last file chosen in Manual Entry list
+        self._sort_col: str = ""            # treeview column currently sorted
+        self._sort_reverse: bool = False    # ascending=False, descending=True
+        self._file_popup = None             # currently open document preview Toplevel
+        self._file_popup_canvas = None      # canvas inside the popup for refreshing
+
+        os.makedirs(DEFAULT_REPORTS_FOLDER, exist_ok=True)
+
+        self._build_ui()
+        self._load_settings_to_ui()
+        self._refresh_client_list_tab()
+        self.protocol("WM_DELETE_WINDOW", self._on_close)
+        # Set icon after ttkbootstrap finishes its own setup to prevent it being overridden
+        self.after(100, self._set_window_icon)
+        self.after(200, self._check_first_run)
+        # Show splash screen (deiconify main window when it closes)
+        SplashScreen(self, on_done=self.deiconify, primary_color=_APP_PRIMARY,
+                     show_duration_ms=7500)
+
+    # ── UI Construction ───────────────────────────────────────
+
+    def _set_window_icon(self):
+        """Set the title bar and taskbar icon to the GDJ logo."""
+        png_path = os.path.join(ASSETS_DIR, "GDJ Logo.png")
+        ico_path = os.path.join(ASSETS_DIR, "GDJ Logo.ico")
+
+        # Generate the .ico from PNG if it doesn't exist yet
+        if not os.path.isfile(ico_path) and PILImage is not None and os.path.isfile(png_path):
+            try:
+                src = PILImage.open(png_path).convert("RGBA")
+                sizes = [256, 128, 64, 48, 32, 16]
+                frames = [src.resize((s, s), PILImage.LANCZOS) for s in sizes]
+                frames[0].save(ico_path, format="ICO",
+                               append_images=frames[1:],
+                               sizes=[(s, s) for s in sizes])
+            except Exception as e:
+                logging.warning(f"Could not create icon file: {e}")
+
+        # Title bar icon (standard tkinter)
+        if os.path.isfile(ico_path):
+            try:
+                self.iconbitmap(ico_path)
+            except Exception as e:
+                logging.warning(f"iconbitmap failed: {e}")
+
+        # Note: taskbar icon cannot be changed while running as python.exe.
+        # It will display correctly once packaged as an .exe with PyInstaller.
+
+    def _build_ui(self):
+        self._build_header()
+        self.notebook = ttk.Notebook(self)
+        self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
+        self._build_process_tab()
+        self._build_review_tab()
+        self._build_clients_tab()
+        self._build_settings_tab()
+
+    def _build_header(self):
+        """Header bar: Speedy Scandocs logo PNG, right-aligned."""
+        header = tk.Frame(self, bg="#ffffff", height=80)
+        header.pack(fill=tk.X)
+        header.pack_propagate(False)
+
+        # Hairline separator beneath the header (palette-coloured)
+        self._header_sep = tk.Frame(self, bg="#dee2e6", height=2)
+        self._header_sep.pack(fill=tk.X)
+
+        self._header_logo = None
+        png_path = os.path.join(ASSETS_DIR, "Speedy Scandocs Logo.png")
+        if PILImage is not None and os.path.isfile(png_path):
+            try:
+                img = PILImage.open(png_path).convert("RGBA")
+                # Trim surrounding whitespace so the logo fills the space cleanly
+                bbox = img.getbbox()
+                if bbox:
+                    img = img.crop(bbox)
+                # Scale to fit inside the header with a small top/bottom margin
+                target_h = 64
+                ratio = target_h / img.height
+                new_w = max(1, int(img.width * ratio))
+                img = img.resize((new_w, target_h), PILImage.LANCZOS)
+                # Composite onto white so RGBA looks clean on the white header
+                bg = PILImage.new("RGB", (new_w, target_h), (255, 255, 255))
+                bg.paste(img, mask=img.split()[3])
+                self._header_logo = PILImageTk.PhotoImage(bg)
+            except Exception as e:
+                logging.warning(f"Could not load header logo: {e}")
+
+        if self._header_logo:
+            lbl = tk.Label(header, image=self._header_logo, bg="#ffffff", bd=0)
+            lbl.place(relx=1.0, rely=0.5, anchor="e", x=-16)
+        else:
+            # Fallback text if image unavailable
+            tk.Label(header, text="Speedy Scandocs", bg="#ffffff",
+                     fg="#212529", font=("Segoe UI", 15, "bold")).place(
+                relx=1.0, rely=0.5, anchor="e", x=-16)
+
+    # ── Tab 1: Process ────────────────────────────────────────
+
+    def _build_process_tab(self):
+        self.style.configure("AutoTab.TFrame", background="#e3f2fd")
+        tab = ttk.Frame(self.notebook, style="AutoTab.TFrame")
+        self.notebook.add(tab, text="  Auto-Process  ")
+        # Accent bar
+        tk.Frame(tab, bg=_APP_PRIMARY, height=6).pack(fill=tk.X)
+
+        # Button row
+        btn_row = ttk.Frame(tab)
+        btn_row.pack(fill=tk.X, padx=10, pady=(10, 4))
+        self.btn_process = ttk.Button(
+            btn_row, text="Auto-Process Documents", command=self._start_processing,
+            bootstyle="primary",
+        )
+        self.btn_process.pack(side=tk.LEFT, padx=(0, 6))
+        self.btn_stop = ttk.Button(
+            btn_row, text="Stop", command=self._stop_processing,
+            state=tk.DISABLED, bootstyle="danger-outline",
+        )
+        self.btn_stop.pack(side=tk.LEFT)
+        right_frame = ttk.Frame(btn_row)
+        right_frame.pack(side=tk.RIGHT)
+        self.btn_open_report = ttk.Button(
+            right_frame, text="Open Report", command=self._open_report,
+            bootstyle="primary-outline",
+        )
+        self.btn_open_report.pack(anchor="e")
+        self.btn_submit_audit = ttk.Button(
+            right_frame, text="Submit Audit", command=self._submit_audit,
+            bootstyle="primary",
+        )
+        # btn_submit_audit visibility is toggled by _apply_audit_mode
+        ttk.Label(
+            right_frame, text="Reports Saved Automatically",
+            font=("", 7), foreground="gray",
+        ).pack(anchor="e")
+
+        # Progress
+        prog_frame = ttk.Frame(tab)
+        prog_frame.pack(fill=tk.X, padx=10, pady=(0, 4))
+        self.progress_var = tk.DoubleVar(value=0)
+        ttk.Progressbar(
+            prog_frame, variable=self.progress_var, maximum=100
+        ).pack(fill=tk.X)
+        self.status_var = tk.StringVar(
+            value="Ready — configure Settings then press Auto-Process Documents."
+        )
+        ttk.Label(prog_frame, textvariable=self.status_var, anchor="w").pack(
+            fill=tk.X, pady=(2, 0)
+        )
+
+        # Results table
+        cols = ("audited", "original", "new_name", "status", "client", "confidence",
+                "new_location")
+        col_cfg = {
+            "audited":      ("✓",              32),
+            "original":     ("Original File",  180),
+            "new_name":     ("New Name",        240),
+            "status":       ("Status",           75),
+            "client":       ("Client",          170),
+            "confidence":   ("Confidence",       75),
+            "new_location": ("New Location",    130),
+        }
+        tree_frame = ttk.Frame(tab)
+        # tree_frame is packed AFTER the bottom panels so it fills remaining space
+
+        self.results_tree = ttk.Treeview(
+            tree_frame, columns=cols, show="headings", selectmode="extended"
+        )
+        # Columns that support click-to-sort
+        _sortable = {"original", "new_name", "status", "client"}
+        for col in cols:
+            label, width = col_cfg[col]
+            if col in _sortable:
+                self.results_tree.heading(
+                    col, text=label,
+                    command=lambda c=col: self._sort_treeview(c))
+            else:
+                self.results_tree.heading(col, text=label)
+            self.results_tree.column(
+                col, width=width,
+                minwidth=32 if col == "audited" else 50,
+                anchor="center" if col == "audited" else "w",
+            )
+
+        self.results_tree.tag_configure("renamed",      background="#d4edda")
+        self.results_tree.tag_configure("needs_review", background="#fff3cd")
+        self.results_tree.tag_configure("error",        background="#f8d7da")
+        self.results_tree.tag_configure("skipped",      background="#e2e3e5")
+        self.results_tree.tag_configure("audited",      background="#fddcb0")
+        self.results_tree.tag_configure("moved",        background="#cce5ff")
+
+        vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=self.results_tree.yview)
+        hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.results_tree.xview)
+        self.results_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side=tk.RIGHT,  fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        self.results_tree.pack(fill=tk.BOTH, expand=True)
+        self.results_tree.bind("<<TreeviewSelect>>", self._on_result_select)
+        self.results_tree.bind("<Return>",          self._on_tree_return)
+        self.results_tree.bind("<Double-Button-1>", self._on_tree_double_click)
+        self.results_tree.bind("<Left>",   self._audit_prev)
+        self.results_tree.bind("<Right>",  self._audit_next)
+        # Mousewheel scroll on the treeview
+        _tree_scroll = lambda e: self.results_tree.yview_scroll(
+            -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units")
+        self._bind_mousewheel(self.results_tree, _tree_scroll)
+
+        # Pack tree now — bottom panels pack after (side=BOTTOM) so they always show
+        tree_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=(4, 0))
+
+        # ── Audit panel ──────────────────────────────────────
+        self.audit_panel = ttk.LabelFrame(tab, text="Audit Mode")
+        self.audit_panel.pack(fill=tk.X, padx=10, pady=(6, 0))
+        audit_outer = self.audit_panel
+
+        # Row 1: filename + Open File button
+        file_row = ttk.Frame(audit_outer)
+        file_row.pack(fill=tk.X, padx=8, pady=(6, 2))
+        self.audit_file_label = ttk.Label(
+            file_row, text="Select a row above to audit it.",
+            foreground="gray", anchor="w",
+        )
+        self.audit_file_label.pack(side=tk.LEFT, fill=tk.X, expand=True)
+        self.audit_open_btn = ttk.Button(
+            file_row, text="Open File", bootstyle="dark-outline",
+            command=self._audit_open_file, state=tk.DISABLED,
+        )
+        self.audit_open_btn.pack(side=tk.RIGHT, padx=(8, 0))
+        self.audit_next_btn = ttk.Button(
+            file_row, text="Next →", bootstyle="dark-outline",
+            command=self._audit_next, state=tk.DISABLED,
+        )
+        self.audit_next_btn.pack(side=tk.RIGHT, padx=(4, 0))
+        self.audit_prev_btn = ttk.Button(
+            file_row, text="← Prev", bootstyle="dark-outline",
+            command=self._audit_prev, state=tk.DISABLED,
+        )
+        self.audit_prev_btn.pack(side=tk.RIGHT, padx=(4, 0))
+
+        # Checkboxes — two rows so all are always visible
+        self.audit_correct_var       = tk.BooleanVar()
+        self.audit_wrong_client_var  = tk.BooleanVar()
+        self.audit_bad_desc_var      = tk.BooleanVar()
+        self.audit_failed_client_var = tk.BooleanVar()
+        self.audit_should_flag_var   = tk.BooleanVar()
+
+        def _make_chk(parent, text, var, flag, fg="#212529"):
+            return tk.Checkbutton(
+                parent, text=text, variable=var,
+                command=lambda: self._on_audit_check(flag),
+                fg=fg, bg="#f8f9fa",
+                activeforeground=fg, activebackground="#f8f9fa",
+                selectcolor="#ffffff",
+                disabledforeground="#adb5bd",
+                font=("Segoe UI", 11),
+                padx=8, pady=6,
+                bd=2,
+                state=tk.DISABLED,
+            )
+
+        # Row 2a: positive check
+        chk_row1 = ttk.Frame(audit_outer)
+        chk_row1.pack(fill=tk.X, padx=8, pady=(2, 0))
+        self.audit_correct_chk = _make_chk(
+            chk_row1, "✓  Correct", self.audit_correct_var, "correct", fg="#1a6e31")
+        self.audit_correct_chk.pack(side=tk.LEFT)
+
+        # Row 2b: problem flags
+        chk_row2 = ttk.Frame(audit_outer)
+        chk_row2.pack(fill=tk.X, padx=8, pady=(2, 8))
+
+        self.audit_wrong_client_chk = _make_chk(
+            chk_row2, "Wrong client name", self.audit_wrong_client_var, "wrong_client")
+        self.audit_wrong_client_chk.pack(side=tk.LEFT, padx=(0, 24))
+
+        self.audit_bad_desc_chk = _make_chk(
+            chk_row2, "Bad description", self.audit_bad_desc_var, "bad_description")
+        self.audit_bad_desc_chk.pack(side=tk.LEFT, padx=(0, 24))
+
+        self.audit_failed_client_chk = _make_chk(
+            chk_row2, "Failed to identify client", self.audit_failed_client_var, "failed_client")
+        self.audit_failed_client_chk.pack(side=tk.LEFT, padx=(0, 24))
+
+        self.audit_should_flag_chk = _make_chk(
+            chk_row2, "Should have been flagged for review", self.audit_should_flag_var, "should_review")
+        self.audit_should_flag_chk.pack(side=tk.LEFT)
+
+        # Row 2c: rename hint — shown when any problem flag is active
+        self.audit_rename_hint_var = tk.StringVar(value="")
+        self.audit_rename_hint_lbl = tk.Label(
+            audit_outer,
+            textvariable=self.audit_rename_hint_var,
+            font=("Segoe UI", 8, "italic"),
+            fg="#777777",
+            bg="#f8f9fa",
+            anchor="w",
+            wraplength=0,   # no wrapping — single line
+        )
+        self.audit_rename_hint_lbl.pack(fill=tk.X, padx=8, pady=(0, 6))
+
+        # ── File Operations panel ─────────────────────────────
+        self.file_ops_panel = ttk.LabelFrame(tab, text="File Mode — Move Files")
+        self.file_ops_panel.pack(fill=tk.X, padx=10, pady=(6, 10))
+
+        # Row 1: destination folder + browse + apply-to-selected
+        dest_row = ttk.Frame(self.file_ops_panel)
+        dest_row.pack(fill=tk.X, padx=8, pady=(8, 4))
+        ttk.Label(dest_row, text="Destination Folder:").pack(side=tk.LEFT)
+        ttk.Entry(dest_row, textvariable=self.fo_dest_var, width=40).pack(
+            side=tk.LEFT, padx=(8, 4), fill=tk.X, expand=True)
+        ttk.Button(
+            dest_row, text="Browse",
+            command=self._fo_browse_dest,
+            bootstyle="dark-outline",
+        ).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(
+            dest_row, text="Apply to Selected",
+            command=self._fo_apply_to_selected,
+            bootstyle="dark-outline",
+        ).pack(side=tk.LEFT)
+
+        # Row 2: commit button + status
+        action_row = ttk.Frame(self.file_ops_panel)
+        action_row.pack(fill=tk.X, padx=8, pady=(0, 8))
+        ttk.Button(
+            action_row, text="Move Files",
+            command=self._fo_move_all,
+            bootstyle="primary",
+        ).pack(side=tk.LEFT)
+        self.fo_status_var = tk.StringVar(value="")
+        ttk.Label(action_row, textvariable=self.fo_status_var,
+                  foreground="gray").pack(side=tk.LEFT, padx=14)
+
+    # ── Tab 2: Manual Entry ───────────────────────────────────
+
+    def _build_review_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="  Manual Entry  ")
+        tk.Frame(tab, bg=_APP_PRIMARY, height=5).pack(fill=tk.X)
+
+        top = ttk.Frame(tab)
+        top.pack(fill=tk.X, padx=10, pady=(10, 0))
+        self.review_count_var = tk.StringVar(value="Files awaiting review: 0")
+        ttk.Label(top, textvariable=self.review_count_var,
+                  font=("", 10, "bold")).pack(side=tk.LEFT)
+        ttk.Button(top, text="Refresh", command=self._refresh_review_tab,
+                   bootstyle="dark-outline").pack(side=tk.RIGHT)
+        ttk.Button(top, text="Next →", command=self._review_next,
+                   bootstyle="dark-outline").pack(side=tk.RIGHT, padx=(4, 6))
+        ttk.Button(top, text="← Prev", command=self._review_prev,
+                   bootstyle="dark-outline").pack(side=tk.RIGHT, padx=(0, 4))
+
+        # File list
+        list_lf = ttk.LabelFrame(tab, text="Files Awaiting Review")
+        list_lf.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
+        self.review_listbox = tk.Listbox(list_lf, selectmode=tk.SINGLE,
+                                         font=("Courier", 10), exportselection=False)
+        rv_sb = ttk.Scrollbar(list_lf, orient="vertical", command=self.review_listbox.yview)
+        self.review_listbox.configure(yscrollcommand=rv_sb.set)
+        rv_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.review_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
+        self.review_listbox.bind("<<ListboxSelect>>", self._on_review_select)
+        self.review_listbox.bind("<Return>",          self._on_review_return)
+        self.review_listbox.bind("<Double-Button-1>", self._on_review_double_click)
+        self.review_listbox.bind("<Left>",   self._review_prev)
+        self.review_listbox.bind("<Right>",  self._review_next)
+        # Up/Down already navigate the Listbox natively and fire <<ListboxSelect>>.
+        _rv_scroll = lambda e: self.review_listbox.yview_scroll(
+            -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units")
+        self._bind_mousewheel(self.review_listbox, _rv_scroll)
+
+        # Assignment panel
+        assign_lf = ttk.LabelFrame(tab, text="Assign Selected File")
+        assign_lf.pack(fill=tk.X, padx=10, pady=(0, 10))
+        assign_lf.columnconfigure(1, weight=1)
+
+        ttk.Label(assign_lf, text="Open file:").grid(
+            row=0, column=0, padx=8, pady=6, sticky="w"
+        )
+        ttk.Button(assign_lf, text="Open in Viewer",
+                   command=self._open_review_file,
+                   bootstyle="dark-outline").grid(
+            row=0, column=1, padx=4, pady=6, sticky="w"
+        )
+
+        # Row 1: Client typing entry
+        ttk.Label(assign_lf, text="Client:").grid(
+            row=1, column=0, padx=8, pady=(6, 2), sticky="nw"
+        )
+        self.review_client_var = tk.StringVar()
+        review_client_entry = ttk.Entry(
+            assign_lf, textvariable=self.review_client_var, width=40
+        )
+        review_client_entry.grid(row=1, column=1, padx=4, pady=(6, 2), sticky="w")
+        review_client_entry.bind("<KeyRelease>", self._filter_client_combo)
+        review_client_entry.bind("<Return>", lambda e: self._assign_review_file())
+
+        # Row 2: Always-visible scrollable client list — shrinks as user types
+        client_lb_frame = ttk.Frame(assign_lf)
+        client_lb_frame.grid(row=2, column=1, padx=4, pady=(0, 4), sticky="ew")
+        self.review_client_listbox = tk.Listbox(
+            client_lb_frame, height=7,
+            font=("Segoe UI", 9),
+            selectmode=tk.SINGLE,
+            exportselection=False,
+            activestyle="none",
+        )
+        cl_lb_vsb = ttk.Scrollbar(client_lb_frame, orient="vertical",
+                                   command=self.review_client_listbox.yview)
+        self.review_client_listbox.configure(yscrollcommand=cl_lb_vsb.set)
+        cl_lb_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.review_client_listbox.pack(fill=tk.X, expand=True)
+        self.review_client_listbox.bind(
+            "<<ListboxSelect>>", self._on_client_listbox_select)
+        self.review_client_listbox.bind(
+            "<Return>", lambda e: self._assign_review_file())
+
+        # Row 3: Subject
+        ttk.Label(assign_lf, text="Subject:").grid(
+            row=3, column=0, padx=8, pady=6, sticky="w"
+        )
+        self.review_subject_var = tk.StringVar()
+        review_subject_entry = ttk.Entry(
+            assign_lf, textvariable=self.review_subject_var, width=40)
+        review_subject_entry.grid(row=3, column=1, padx=4, pady=6, sticky="w")
+        review_subject_entry.bind("<Return>", lambda e: self._assign_review_file())
+
+        # Row 4: Destination folder (shown only when File Mode is on)
+        self.review_dest_label = ttk.Label(assign_lf, text="Move to folder:")
+        self.review_dest_label.grid(row=4, column=0, padx=8, pady=6, sticky="w")
+        self.review_dest_label.grid_remove()
+        review_dest_inner = ttk.Frame(assign_lf)
+        review_dest_inner.grid(row=4, column=1, padx=4, pady=6, sticky="ew")
+        review_dest_inner.grid_remove()
+        ttk.Entry(review_dest_inner, textvariable=self.fo_dest_var).pack(
+            side=tk.LEFT, padx=(0, 4), fill=tk.X, expand=True)
+        ttk.Button(review_dest_inner, text="Browse",
+                   command=self._fo_browse_dest,
+                   bootstyle="dark-outline").pack(side=tk.LEFT)
+        self._review_dest_widgets = [self.review_dest_label, review_dest_inner]
+
+        # Row 5: Submit button
+        _btn_assign = ttk.Button(assign_lf, text="Assign, Rename, & Move",
+                   command=self._assign_review_file,
+                   bootstyle="primary")
+        _btn_assign.grid(
+            row=5, column=1, padx=4, pady=(2, 8), sticky="w"
+        )
+
+    # ── Tab 3: Client List ────────────────────────────────────
+
+    def _build_clients_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="  Client List  ")
+
+        ttk.Label(
+            tab,
+            text="Format: LAST, First   (e.g.  GARCIA, Maria  |  REYES, Carlos A)",
+            foreground="gray",
+        ).pack(anchor="w", padx=10, pady=(10, 2))
+
+        # List + scrollbar
+        list_frame = ttk.Frame(tab)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        self.client_listbox = tk.Listbox(
+            list_frame, selectmode=tk.SINGLE, font=("Courier", 10)
+        )
+        cl_sb = ttk.Scrollbar(list_frame, orient="vertical",
+                               command=self.client_listbox.yview)
+        self.client_listbox.configure(yscrollcommand=cl_sb.set)
+        cl_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.client_listbox.pack(fill=tk.BOTH, expand=True)
+        _cl_scroll = lambda e: self.client_listbox.yview_scroll(
+            -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units")
+        self._bind_mousewheel(self.client_listbox, _cl_scroll)
+
+        # Add / Remove
+        edit_frame = ttk.Frame(tab)
+        edit_frame.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self.new_client_var = tk.StringVar()
+        entry = ttk.Entry(edit_frame, textvariable=self.new_client_var, width=32)
+        entry.pack(side=tk.LEFT, padx=(0, 6))
+        entry.bind("<Return>", lambda _: self._add_client())
+        entry.bind("<KeyRelease>", lambda _: self._on_client_entry_key())
+        _btn_add_cl = ttk.Button(edit_frame, text="Add Client",
+                   command=self._add_client,
+                   bootstyle="primary-outline")
+        _btn_add_cl.pack(side=tk.LEFT, padx=(0, 6))
+        _btn_rm_cl = ttk.Button(edit_frame, text="Remove Selected",
+                   command=self._remove_client,
+                   bootstyle="danger-outline")
+        _btn_rm_cl.pack(side=tk.LEFT)
+
+        # Dynamic "Add X to list" suggestion — shown when typed name is not yet in the list
+        self._add_suggestion_lbl = tk.Label(
+            tab, text="", fg="#1565c0", bg="#ffffff",
+            font=("Segoe UI", 9, "underline"), cursor="hand2", anchor="w",
+        )
+        self._add_suggestion_lbl.pack(fill=tk.X, padx=12, pady=(0, 2))
+        self._add_suggestion_lbl.bind("<Button-1>", lambda _: self._add_client())
+
+        # Save row
+        save_frame = ttk.Frame(tab)
+        save_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        _btn_save_cl = ttk.Button(save_frame, text="Save Client List",
+                   command=self._save_client_list,
+                   bootstyle="primary")
+        _btn_save_cl.pack(side=tk.LEFT)
+        self.client_status_var = tk.StringVar(value="")
+        ttk.Label(save_frame, textvariable=self.client_status_var,
+                  foreground="green").pack(side=tk.LEFT, padx=10)
+
+    # ── Tab 4: Settings ───────────────────────────────────────
+
+    def _build_settings_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self.notebook.add(tab, text="  Settings  ")
+
+        # ── Scrollable wrapper ────────────────────────────────
+        _scroll_canvas = tk.Canvas(tab, highlightthickness=0)
+        _vsb = ttk.Scrollbar(tab, orient="vertical", command=_scroll_canvas.yview)
+        _scroll_canvas.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        _scroll_canvas.pack(fill=tk.BOTH, expand=True)
+
+        outer = ttk.Frame(_scroll_canvas)
+        _win_id = _scroll_canvas.create_window((0, 0), window=outer, anchor="nw")
+
+        def _on_inner_configure(e):
+            _scroll_canvas.configure(scrollregion=_scroll_canvas.bbox("all"))
+        outer.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(e):
+            _scroll_canvas.itemconfig(_win_id, width=e.width)
+        _scroll_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(e):
+            _scroll_canvas.yview_scroll(
+                -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units")
+        # Bind scroll recursively after the tab is fully built (so all children exist)
+        self.after(200, lambda: ScandocsApp._bind_mousewheel(tab, _on_mousewheel))
+
+        # ── Inner padding frame (same variable name 'outer' the rest of
+        #    _build_settings_tab uses, so nothing below changes) ──────
+        outer = ttk.Frame(outer, padding=(20, 15, 20, 15))
+        outer.pack(fill=tk.BOTH, expand=True)
+
+        def add_row(parent, row_idx, label_text, str_var,
+                    browse_dir=False, browse_file=False, masked=False, info_msg=None):
+            ttk.Label(parent, text=label_text).grid(
+                row=row_idx, column=0, sticky="w", pady=5
+            )
+            kw = {"textvariable": str_var, "width": 46}
+            if masked:
+                kw["show"] = "*"
+            entry = ttk.Entry(parent, **kw)
+            entry.grid(row=row_idx, column=1, sticky="ew", padx=(8, 4))
+            if browse_dir:
+                _b = ttk.Button(
+                    parent, text="Browse",
+                    command=lambda v=str_var: self._browse_dir(v),
+                    bootstyle="primary-outline",
+                )
+                _b.grid(row=row_idx, column=2, padx=(0, 4))
+            elif browse_file:
+                _b = ttk.Button(
+                    parent, text="Browse",
+                    command=lambda v=str_var: self._browse_file(v),
+                    bootstyle="primary-outline",
+                )
+                _b.grid(row=row_idx, column=2, padx=(0, 4))
+            if info_msg:
+                _q = ttk.Button(
+                    parent, text="?", width=2,
+                    command=lambda msg=info_msg: messagebox.showinfo("Help", msg),
+                    bootstyle="primary-outline",
+                )
+                _q.grid(row=row_idx, column=3, padx=(0, 4))
+
+        # Paths
+        paths_lf = ttk.LabelFrame(outer, text="Paths")
+        paths_lf.pack(fill=tk.X, pady=(0, 10))
+        paths_lf.columnconfigure(1, weight=1)
+        self.s_scandocs_var = tk.StringVar()
+        self.s_client_list_var = tk.StringVar()
+        add_row(paths_lf, 0, "Scandocs Folder:", self.s_scandocs_var, browse_dir=True)
+        add_row(paths_lf, 1, "Client List File:", self.s_client_list_var, browse_file=True)
+
+        # API
+        api_lf = ttk.LabelFrame(outer, text="API Settings")
+        api_lf.pack(fill=tk.X, pady=(0, 10))
+        api_lf.columnconfigure(1, weight=1)
+        self.s_owui_url_var = tk.StringVar()
+        self.s_ollama_url_var = tk.StringVar()
+        self.s_model_var = tk.StringVar()
+        self.s_api_key_var = tk.StringVar()
+        add_row(api_lf, 0, "OpenWebUI URL:", self.s_owui_url_var)
+        add_row(api_lf, 1, "Ollama URL:", self.s_ollama_url_var)
+
+        # Model row — editable Combobox + Refresh button
+        _FALLBACK_MODELS = [
+            "llama3.2-vision", "llama3.2", "llama3.1", "llama3",
+            "mistral", "mixtral", "phi3", "gemma2", "qwen2",
+            "deepseek-r1", "llava", "bakllava",
+        ]
+        ttk.Label(api_lf, text="Model:").grid(row=2, column=0, sticky="w", pady=5)
+        self.s_model_combo = ttk.Combobox(
+            api_lf, textvariable=self.s_model_var,
+            values=_FALLBACK_MODELS, width=44
+        )
+        self.s_model_combo.grid(row=2, column=1, sticky="ew", padx=(8, 4))
+        ttk.Button(
+            api_lf, text="⟳", width=3,
+            command=self._refresh_models,
+            bootstyle="primary-outline",
+        ).grid(row=2, column=2, padx=(0, 4))
+
+        add_row(api_lf, 3, "API Key (optional):", self.s_api_key_var, masked=True,
+                info_msg=(
+                    "API Key\n\n"
+                    "Only required if your OpenWebUI instance has authentication enabled.\n\n"
+                    "To find your key: in OpenWebUI go to Settings → Account → "
+                    "API Keys, then generate or copy an existing key.\n\n"
+                    "Leave blank if your server does not require authentication "
+                    "(typical for local setups)."
+                ))
+
+        # Processing
+        proc_lf = ttk.LabelFrame(outer, text="Processing")
+        proc_lf.pack(fill=tk.X, pady=(0, 10))
+        proc_lf.columnconfigure(1, weight=1)
+        self.s_threshold_var = tk.StringVar()
+        self.s_max_chars_var = tk.StringVar()
+        self.s_max_pages_var = tk.StringVar()
+        add_row(proc_lf, 0, "Fuzzy Match Threshold (0.0 – 1.0):", self.s_threshold_var,
+                info_msg=(
+                    "Fuzzy Match Threshold\n\n"
+                    "Controls how closely a client name found in a document must match "
+                    "a name in your client list before it is accepted.\n\n"
+                    "1.0 = exact match only\n"
+                    "0.85 = allows small differences (recommended)\n"
+                    "0.70 = more lenient — may cause false matches\n\n"
+                    "If the tool is failing to recognise clients whose names appear "
+                    "slightly differently in documents (e.g. missing accents, "
+                    "abbreviations), try lowering this value slightly."
+                ))
+        add_row(proc_lf, 1, "Max OCR Characters:", self.s_max_chars_var,
+                info_msg=(
+                    "Max OCR Characters\n\n"
+                    "The maximum number of characters of extracted text that will be "
+                    "sent to the AI for classification.\n\n"
+                    "Higher values give the AI more context but increase the time each "
+                    "file takes to process.\n\n"
+                    "2000–4000 is usually sufficient for identifying the client and "
+                    "document type from the first page or two of a document."
+                ))
+        add_row(proc_lf, 2, "Max Pages Per Document:", self.s_max_pages_var,
+                info_msg=(
+                    "Max Pages Per Document\n\n"
+                    "The maximum number of pages that will be read from each PDF.\n\n"
+                    "Keeping this low (5–10) prevents very large documents from "
+                    "slowing down the batch. Client names and document types are "
+                    "almost always found within the first few pages."
+                ))
+        ttk.Checkbutton(
+            proc_lf,
+            text="Require high confidence — only rename when AI is confident (recommended)",
+            variable=self.s_require_high_conf_var,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 0))
+        ttk.Label(
+            proc_lf,
+            text="  When unchecked, medium-confidence results are also renamed (more matches, higher false-positive risk)",
+            font=("Segoe UI", 8), foreground="gray",
+        ).grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+        # Reports
+        rep_lf = ttk.LabelFrame(outer, text="Reports")
+        rep_lf.pack(fill=tk.X, pady=(0, 10))
+        rep_lf.columnconfigure(1, weight=1)
+        self.s_report_folder_var = tk.StringVar()
+        add_row(rep_lf, 0, "Report Folder:", self.s_report_folder_var, browse_dir=True)
+        self.s_auto_save_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            rep_lf, text="Auto-save report when batch completes",
+            variable=self.s_auto_save_var,
+        ).grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+        self.s_audit_mode_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            rep_lf,
+            text="Audit Mode — prompt employee to review each result before closing",
+            variable=self.s_audit_mode_var,
+            command=self._apply_audit_mode,
+        ).grid(row=2, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 4))
+        _q_audit = ttk.Button(
+            rep_lf, text="?", width=2,
+            command=lambda: messagebox.showinfo("Audit Mode",
+                "Audit Mode\n\n"
+                "When enabled, an Audit Mode panel appears below the results table.\n\n"
+                "For each document, mark one of:\n"
+                "  ✓ Correct — the rename was accurate\n"
+                "  Wrong Client Name — Submit Audit will rename it to A-NEEDS REVIEW\n"
+                "  Bad Description — Submit Audit will change the description to 'Scanned Document'\n"
+                "  Failed to Identify Client — tool could not find the client\n"
+                "  Should Have Been Flagged — should have been sent to Manual Entry\n\n"
+                "Click 'Submit Audit' to apply all corrections and save the report."),
+            bootstyle="primary-outline",
+        )
+        _q_audit.grid(row=2, column=3, padx=(0, 4), pady=(0, 4), sticky="w")
+
+        self.s_file_mode_var = tk.BooleanVar()
+        ttk.Checkbutton(
+            rep_lf,
+            text="File Mode — allow moving renamed files to a destination folder",
+            variable=self.s_file_mode_var,
+            command=self._apply_file_mode,
+        ).grid(row=3, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 2))
+        _q_file = ttk.Button(
+            rep_lf, text="?", width=2,
+            command=lambda: messagebox.showinfo("File Mode",
+                "File Mode\n\n"
+                "When enabled, a 'File Mode — Move Files' panel appears on the "
+                "selected tabs.\n\n"
+                "Use 'Apply to Selected' to stage destination folders for one or more "
+                "files, then 'Move Files' to commit all staged moves.\n\n"
+                "You can enable File Mode independently for the Auto-Process tab and "
+                "the Manual Entry tab."),
+            bootstyle="primary-outline",
+        )
+        _q_file.grid(row=3, column=3, padx=(0, 4), pady=(0, 2), sticky="w")
+
+        # Sub-checkboxes: per-tab enable
+        sub_frame = ttk.Frame(rep_lf)
+        sub_frame.grid(row=4, column=0, columnspan=4, sticky="w", padx=28, pady=(0, 8))
+        self._fm_auto_chk = ttk.Checkbutton(
+            sub_frame, text="Enable in Auto-Process tab",
+            variable=self.s_file_mode_auto_var,
+            command=self._apply_file_mode,
+        )
+        self._fm_auto_chk.pack(side=tk.LEFT, padx=(0, 16))
+        self._fm_manual_chk = ttk.Checkbutton(
+            sub_frame, text="Enable in Manual Entry tab",
+            variable=self.s_file_mode_manual_var,
+            command=self._apply_file_mode,
+        )
+        self._fm_manual_chk.pack(side=tk.LEFT)
+        self._file_mode_sub_frame = sub_frame
+
+        # ── Suggest Location sub-option ───────────────────────────
+        self._fm_suggest_frame = ttk.Frame(rep_lf)
+        self._fm_suggest_frame.grid(row=5, column=0, columnspan=4, sticky="w",
+                                    padx=28, pady=(0, 4))
+
+        self._fm_suggest_chk = ttk.Checkbutton(
+            self._fm_suggest_frame,
+            text="Suggest Location — automatically find the client's folder",
+            state=tk.DISABLED,
+        )
+        self._fm_suggest_chk.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            self._fm_suggest_frame,
+            text="Coming Soon",
+            foreground="#999999",
+            font=("Segoe UI", 8, "italic"),
+        ).pack(side=tk.LEFT)
+
+        # ── Auto-commit stub (Coming Soon) ────────────────────────
+        self._fm_autocommit_frame = ttk.Frame(rep_lf)
+        self._fm_autocommit_frame.grid(row=7, column=0, columnspan=4, sticky="w",
+                                       padx=28, pady=(0, 8))
+        _ac_chk = ttk.Checkbutton(
+            self._fm_autocommit_frame,
+            text="Auto-commit file moves",
+            state=tk.DISABLED,
+        )
+        _ac_chk.pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Label(
+            self._fm_autocommit_frame,
+            text="Coming Soon — The tool will file documents automatically without human oversight.",
+            foreground="#999999",
+            font=("Segoe UI", 8, "italic"),
+        ).pack(side=tk.LEFT)
+
+        # Buttons + status
+        btn_row = ttk.Frame(outer)
+        btn_row.pack(fill=tk.X, pady=6)
+        self._btn_test_conn = ttk.Button(btn_row, text="Test API Connection",
+                   command=self._test_connection,
+                   bootstyle="primary-outline")
+        self._btn_test_conn.pack(side=tk.LEFT, padx=(0, 10))
+        self._btn_save_settings = ttk.Button(btn_row, text="Save Settings",
+                   command=self._save_settings,
+                   bootstyle="primary")
+        self._btn_save_settings.pack(side=tk.LEFT)
+        self.conn_status_var = tk.StringVar(value="")
+        self.conn_label = ttk.Label(btn_row, textvariable=self.conn_status_var)
+        self.conn_label.pack(side=tk.LEFT, padx=14)
+
+    # ── Settings helpers ──────────────────────────────────────
+
+    def _load_settings_to_ui(self):
+        cfg = self.config_mgr.config
+        self.s_scandocs_var.set(cfg["paths"]["scandocs_folder"])
+        self.s_client_list_var.set(cfg["paths"]["client_list_file"])
+        self.s_owui_url_var.set(cfg["api"]["openwebui_url"])
+        self.s_ollama_url_var.set(cfg["api"]["ollama_url"])
+        self.s_model_var.set(cfg["api"]["model"])
+        self.s_api_key_var.set(cfg["api"]["api_key"])
+        self.s_threshold_var.set(str(cfg["processing"]["fuzzy_threshold"]))
+        self.s_max_chars_var.set(str(cfg["processing"]["max_ocr_chars"]))
+        self.s_report_folder_var.set(
+            cfg["reports"].get("report_folder", DEFAULT_REPORTS_FOLDER)
+        )
+        self.s_auto_save_var.set(cfg["reports"].get("auto_save", True))
+        self.s_audit_mode_var.set(cfg["processing"].get("audit_mode", True))
+        self.s_file_mode_var.set(cfg["processing"].get("file_mode", False))
+        self.s_file_mode_auto_var.set(cfg["processing"].get("file_mode_auto", True))
+        self.s_file_mode_manual_var.set(cfg["processing"].get("file_mode_manual", True))
+        self.fo_dest_var.set(cfg["processing"].get("file_mode_destination", ""))
+        self.s_suggest_loc_var.set(cfg["processing"].get("suggest_location_enabled", False))
+        self.s_suggest_parent_var.set(cfg["processing"].get("suggest_location_parent_folder", ""))
+        self.s_max_pages_var.set(str(cfg["processing"].get("max_pages", 5)))
+        self.s_require_high_conf_var.set(cfg["processing"].get("require_high_confidence", True))
+        self.after(0, self._apply_audit_mode)
+        self.after(0, self._apply_file_mode)
+        self.after(400, self._apply_round_styling)
+        # Populate model list in background (won't block startup)
+        self.after(300, self._refresh_models)
+
+    def _save_settings(self):
+        try:
+            threshold = float(self.s_threshold_var.get())
+            if not (0.0 <= threshold <= 1.0):
+                raise ValueError("Fuzzy match threshold must be between 0.0 and 1.0.")
+            max_chars = int(self.s_max_chars_var.get())
+            if max_chars < 100:
+                raise ValueError("Max OCR characters must be at least 100.")
+            max_pages = int(self.s_max_pages_var.get())
+            if max_pages < 1:
+                raise ValueError("Max pages must be at least 1.")
+        except ValueError as e:
+            messagebox.showerror("Invalid Value", str(e))
+            return
+
+        cfg = self.config_mgr.config
+        cfg["paths"]["scandocs_folder"]   = self.s_scandocs_var.get().strip()
+        cfg["paths"]["client_list_file"]  = self.s_client_list_var.get().strip()
+        cfg["api"]["openwebui_url"]        = self.s_owui_url_var.get().strip()
+        cfg["api"]["ollama_url"]           = self.s_ollama_url_var.get().strip()
+        cfg["api"]["model"]                = self.s_model_var.get().strip()
+        cfg["api"]["api_key"]              = self.s_api_key_var.get().strip()
+        cfg["processing"]["fuzzy_threshold"] = threshold
+        cfg["processing"]["max_ocr_chars"]   = max_chars
+        cfg["processing"]["max_pages"]        = max_pages
+        cfg["reports"]["report_folder"] = (
+            self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
+        )
+        cfg["reports"]["auto_save"] = self.s_auto_save_var.get()
+        cfg["processing"]["audit_mode"]             = self.s_audit_mode_var.get()
+        cfg["processing"]["file_mode"]              = self.s_file_mode_var.get()
+        cfg["processing"]["file_mode_auto"]         = self.s_file_mode_auto_var.get()
+        cfg["processing"]["file_mode_manual"]       = self.s_file_mode_manual_var.get()
+        cfg["processing"]["file_mode_destination"]        = self.fo_dest_var.get().strip()
+        cfg["processing"]["suggest_location_enabled"]     = self.s_suggest_loc_var.get()
+        cfg["processing"]["suggest_location_parent_folder"] = self.s_suggest_parent_var.get().strip()
+        cfg["processing"]["require_high_confidence"]       = self.s_require_high_conf_var.get()
+        self.config_mgr.save(cfg)
+        self._apply_audit_mode()
+        self._apply_file_mode()
+        messagebox.showinfo("Saved", "Settings saved successfully.")
+
+    def _browse_dir(self, var: tk.StringVar):
+        init = var.get() or SCRIPT_DIR
+        d = filedialog.askdirectory(title="Select Folder", initialdir=init)
+        if d:
+            var.set(os.path.normpath(d))
+
+    def _browse_file(self, var: tk.StringVar):
+        init = os.path.dirname(var.get()) if var.get() else SCRIPT_DIR
+        f = filedialog.askopenfilename(
+            title="Select File",
+            initialdir=init,
+            filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+        )
+        if f:
+            var.set(os.path.normpath(f))
+
+    def _refresh_models(self):
+        """Fetch available models from Ollama and populate the Model combobox."""
+        _FALLBACK_MODELS = [
+            "llama3.2-vision", "llama3.2", "llama3.1", "llama3",
+            "mistral", "mixtral", "phi3", "gemma2", "qwen2",
+            "deepseek-r1", "llava", "bakllava",
+        ]
+        ollama_url = self.s_ollama_url_var.get().strip() or "http://localhost:11434"
+
+        def _run():
+            try:
+                import requests as _req
+                resp = _req.get(
+                    f"{ollama_url.rstrip('/')}/api/tags",
+                    timeout=5,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+                models = sorted(m["name"] for m in data.get("models", []))
+                if not models:
+                    raise ValueError("Empty model list")
+            except Exception:
+                models = _FALLBACK_MODELS
+            self.after(0, lambda: self._apply_model_list(models))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _apply_model_list(self, models: list):
+        current = self.s_model_var.get().strip()
+        self.s_model_combo["values"] = models
+        # Keep the current selection if it's still valid, otherwise set first entry
+        if current not in models and models:
+            # Only overwrite if the field is blank or was a fallback default
+            pass  # leave whatever the user typed / saved
+        if not current and models:
+            self.s_model_var.set(models[0])
+
+    def _test_connection(self):
+        self.conn_status_var.set("Testing…")
+        self.conn_label.config(foreground="gray")
+        self.update_idletasks()
+        # Build a temporary config from the current (unsaved) field values
+        cfg = ConfigManager._deep_copy(self.config_mgr.config)
+        cfg["api"].update({
+            "openwebui_url": self.s_owui_url_var.get().strip(),
+            "ollama_url":    self.s_ollama_url_var.get().strip(),
+            "model":         self.s_model_var.get().strip(),
+            "api_key":       self.s_api_key_var.get().strip(),
+        })
+
+        def _run():
+            ok, msg = APIClient.test_connection(cfg)
+            self.after(0, lambda: self._show_conn_result(ok, msg))
+
+        threading.Thread(target=_run, daemon=True).start()
+
+    def _show_conn_result(self, ok: bool, msg: str):
+        self.conn_status_var.set(msg)
+        self.conn_label.config(foreground="green" if ok else "red")
+
+    # ── Client list tab helpers ───────────────────────────────
+
+    def _on_client_entry_key(self):
+        """Show/hide the Add suggestion label as the user types."""
+        typed = self.new_client_var.get().strip()
+        if not typed:
+            self._add_suggestion_lbl.config(text="")
+            return
+        existing = [c.lower() for c in self.client_listbox.get(0, tk.END)]
+        if typed.lower() in existing:
+            self._add_suggestion_lbl.config(text="")
+        else:
+            self._add_suggestion_lbl.config(text=f'  + Add "{typed}" to client list')
+
+    def _refresh_client_list_tab(self):
+        path = self.config_mgr.config["paths"]["client_list_file"]
+        clients = ClientListManager.load(path)
+        self.client_listbox.delete(0, tk.END)
+        for c in clients:
+            self.client_listbox.insert(tk.END, c)
+
+    def _add_client(self):
+        name = self.new_client_var.get().strip()
+        if not name:
+            return
+        if not ClientListManager.is_valid_format(name):
+            # Completely invalid (no comma, etc.) — hard warning, don't add
+            messagebox.showwarning(
+                "Invalid Format",
+                f'"{name}" is not in LAST, First format.\n\nExample: GARCIA, Maria',
+            )
+            return
+        # Check for the expected ALL-CAPS LAST, Title First convention
+        _convention_ok = bool(re.match(
+            r"^[A-Z][A-Z\-\'\.\s]+,\s+[A-Z][a-z]", name.strip()
+        ))
+        if not _convention_ok:
+            if not messagebox.askyesno(
+                "Format Warning",
+                "The client name format doesn't match the expected format (LAST, First).\n\n"
+                "Expected: ALL-CAPS last name, comma, Title-case first name\n"
+                f'Example: GARCIA, Maria\n\nYou entered: "{name}"\n\n'
+                "Would you like to proceed anyway?"
+            ):
+                return
+        existing = list(self.client_listbox.get(0, tk.END))
+        if name in existing:
+            messagebox.showinfo("Duplicate", f'"{name}" is already in the list.')
+            return
+        existing.append(name)
+        existing.sort()
+        self.client_listbox.delete(0, tk.END)
+        for item in existing:
+            self.client_listbox.insert(tk.END, item)
+        self.new_client_var.set("")
+        self._add_suggestion_lbl.config(text="")
+        self.client_status_var.set("Unsaved changes")
+
+    def _remove_client(self):
+        sel = self.client_listbox.curselection()
+        if not sel:
+            return
+        name = self.client_listbox.get(sel[0])
+        if messagebox.askyesno("Remove", f'Remove "{name}" from the list?'):
+            self.client_listbox.delete(sel[0])
+            self.client_status_var.set("Unsaved changes")
+
+    def _save_client_list(self):
+        path = self.config_mgr.config["paths"]["client_list_file"]
+        if not path:
+            messagebox.showerror(
+                "Not Configured",
+                "Client list file path is not set.\nConfigure it in Settings first.",
+            )
+            return
+        clients = list(self.client_listbox.get(0, tk.END))
+        try:
+            ClientListManager.save(path, clients)
+            self.client_status_var.set(f"Saved {len(clients)} client(s)")
+            self.after(3000, lambda: self.client_status_var.set(""))
+        except Exception as e:
+            messagebox.showerror("Save Failed", str(e))
+
+    # ── Review tab helpers ────────────────────────────────────
+
+    def _refresh_review_tab(self):
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        client_list_path = self.config_mgr.config["paths"]["client_list_file"]
+
+        self._review_selected_file = ""   # clear stale selection
+        self.review_listbox.delete(0, tk.END)
+        if not os.path.isdir(scandocs):
+            self.review_count_var.set("Scandocs folder not found")
+            return
+
+        client_list = ClientListManager.load(client_list_path)
+
+        # Show any file that does not already match the expected
+        # "LAST, First - Subject.ext" format with a recognised client name.
+        review_files = sorted(
+            f for f in os.listdir(scandocs)
+            if os.path.isfile(os.path.join(scandocs, f))
+            and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+            and not FileProcessor._already_processed(f, client_list)
+        )
+        for f in review_files:
+            self.review_listbox.insert(tk.END, f)
+        self.review_count_var.set(f"Files awaiting review: {len(review_files)}")
+
+        self._all_clients = client_list
+        self.review_client_listbox.delete(0, tk.END)
+        for name in client_list:
+            self.review_client_listbox.insert(tk.END, name)
+
+    def _on_review_select(self, _event):
+        sel = self.review_listbox.curselection()
+        if not sel:
+            return
+        filename = self.review_listbox.get(sel[0])
+        self._review_selected_file = filename   # remember even if focus moves away
+        # Pre-fill the subject field: extract whatever comes after " - " if present,
+        # otherwise use the bare filename (without extension) as a starting point.
+        m = re.match(r"^.+? - (.+)\.(pdf|jpg|jpeg)$", filename, re.IGNORECASE)
+        if m:
+            self.review_subject_var.set(m.group(1))
+        else:
+            self.review_subject_var.set(os.path.splitext(filename)[0])
+
+        # If the preview popup is open, refresh it with the newly selected file
+        if self._file_popup is not None and self._file_popup.winfo_exists():
+            path = os.path.join(
+                self.config_mgr.config["paths"]["scandocs_folder"], filename)
+            if os.path.isfile(path):
+                self._refresh_popup_content(path)
+
+    def _open_review_file(self):
+        sel = self.review_listbox.curselection()
+        filename = (self.review_listbox.get(sel[0]) if sel
+                    else self._review_selected_file)
+        if not filename:
+            messagebox.showinfo("No Selection", "Please select a file from the list first.")
+            return
+        path = os.path.join(
+            self.config_mgr.config["paths"]["scandocs_folder"], filename
+        )
+        if os.path.isfile(path):
+            self._open_file_popup(path)
+        else:
+            messagebox.showerror("File Not Found", f"{filename} no longer exists.")
+            self._refresh_review_tab()
+
+    def _assign_review_file(self):
+        # Use the stored selection — it persists even when focus is on the Assign fields
+        sel = self.review_listbox.curselection()
+        filename = (self.review_listbox.get(sel[0]) if sel
+                    else self._review_selected_file)
+        if not filename:
+            messagebox.showinfo("No Selection", "Please select a file from the list first.")
+            return
+        client  = self.review_client_var.get().strip()
+        subject = self.review_subject_var.get().strip()
+
+        if not client:
+            messagebox.showwarning("Missing Client", "Please select a client from the dropdown.")
+            return
+        if not subject:
+            messagebox.showwarning("Missing Subject", "Please enter a subject for the document.")
+            return
+
+        ext      = os.path.splitext(filename)[1].lower()
+        safe_sub = FileProcessor._safe_subject(subject) or "Document"
+        new_name = f"{client} - {safe_sub}{ext}"
+
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        new_name = FileProcessor._resolve_collision(scandocs, new_name, filename)
+        src = os.path.join(scandocs, filename)
+        dst = os.path.join(scandocs, new_name)
+        try:
+            os.rename(src, dst)
+            # If file mode is on and a destination is set, move the renamed file there
+            if self.s_file_mode_var.get():
+                dest = self.fo_dest_var.get().strip()
+                if dest and os.path.isdir(dest):
+                    import shutil
+                    final_name = new_name
+                    final_dst = os.path.join(dest, final_name)
+                    counter = 1
+                    base2, ext2 = os.path.splitext(final_name)
+                    while os.path.exists(final_dst):
+                        final_name = f"{base2} ({counter}){ext2}"
+                        final_dst = os.path.join(dest, final_name)
+                        counter += 1
+                    shutil.move(dst, final_dst)
+                    messagebox.showinfo("Success",
+                        f"Renamed and moved to:\n{os.path.basename(dest)}")
+                else:
+                    messagebox.showinfo("Success", f"Renamed to:\n{new_name}")
+            else:
+                messagebox.showinfo("Success", f"Renamed to:\n{new_name}")
+            self._refresh_review_tab()
+            self.review_client_var.set("")
+            self.review_subject_var.set("")
+        except Exception as e:
+            messagebox.showerror("Rename Failed", str(e))
+
+    # ── Processing ────────────────────────────────────────────
+
+    def _start_processing(self):
+        errors = self.config_mgr.validate()
+        if errors:
+            messagebox.showerror(
+                "Configuration Error",
+                "\n".join(errors) + "\n\nPlease fix these in Settings.",
+            )
+            self.notebook.select(3)
+            return
+
+        # Clear old results
+        for row in self.results_tree.get_children():
+            self.results_tree.delete(row)
+        self._results.clear()
+        self._iid_to_result.clear()
+        self._total_files = 0
+        self.progress_var.set(0)
+        # Reset audit panel
+        self.audit_file_label.config(
+            text="Select a row above to audit it.", foreground="gray"
+        )
+        self._audit_updating = True
+        self.audit_correct_var.set(False)
+        self.audit_wrong_client_var.set(False)
+        self.audit_bad_desc_var.set(False)
+        self.audit_failed_client_var.set(False)
+        self.audit_should_flag_var.set(False)
+        self._audit_updating = False
+        for w in (self.audit_open_btn, self.audit_prev_btn, self.audit_next_btn,
+                  self.audit_correct_chk, self.audit_wrong_client_chk,
+                  self.audit_bad_desc_chk, self.audit_failed_client_chk,
+                  self.audit_should_flag_chk):
+            w.config(state=tk.DISABLED)
+        self.status_var.set("Starting…")
+        self.btn_process.config(state=tk.DISABLED)
+        self.btn_stop.config(state=tk.NORMAL)
+        # Reset audit submit button for new run
+        self.btn_submit_audit.config(state=tk.NORMAL, text="Submit Audit")
+        self._processing_active = True
+
+        t = threading.Thread(
+            target=self.engine.run_batch,
+            args=(self.config_mgr.config, self._queue),
+            daemon=True,
+        )
+        t.start()
+        self.after(100, self._poll_queue)
+
+    def _stop_processing(self):
+        self.engine.stop()
+        self.status_var.set("Stopping after current file…")
+        self.btn_stop.config(state=tk.DISABLED)
+
+    def _poll_queue(self):
+        try:
+            while True:
+                msg = self._queue.get_nowait()
+                mtype = msg["type"]
+
+                if mtype == "total":
+                    self._total_files = msg["count"]
+                    self.status_var.set(
+                        f"Found {self._total_files} file(s). Processing…"
+                    )
+
+                elif mtype == "progress":
+                    n = msg["current"]
+                    pct = (n / self._total_files * 100) if self._total_files else 0
+                    self.progress_var.set(pct)
+                    self.status_var.set(
+                        f"Processing {n} / {self._total_files}: {msg['filename']}"
+                    )
+
+                elif mtype == "result":
+                    result = msg["result"]
+                    # Suggest Location: pre-fill pending_dest if enabled
+                    if (self.s_suggest_loc_var.get()
+                            and self.s_file_mode_var.get()
+                            and result.status in ("renamed", "needs_review")
+                            and result.client
+                            and not result.pending_dest):
+                        _parent = self.s_suggest_parent_var.get().strip()
+                        _desc = result.description
+                        suggested = self._suggest_location(result.client, _desc, _parent)
+                        if suggested:
+                            result.pending_dest = suggested
+                    self._add_result_row(result)
+
+                elif mtype == "error":
+                    messagebox.showerror("Error", msg["message"])
+                    self._finish_processing()
+                    return
+
+                elif mtype == "stopped":
+                    self.status_var.set("Stopped by user.")
+                    self._finish_processing()
+                    return
+
+                elif mtype == "done":
+                    self.progress_var.set(100)
+                    self.status_var.set(
+                        f"Done. {len(self._results)} file(s) processed."
+                    )
+                    self._finish_processing(auto_save=True)
+                    self._refresh_review_tab()
+                    return
+
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _finish_processing(self, auto_save: bool = False):
+        self._processing_active = False
+        self.btn_process.config(state=tk.NORMAL)
+        self.btn_stop.config(state=tk.DISABLED)
+        # If the user finished auditing while processing was still running,
+        # the audit-complete check was deferred — run it now.
+        self._check_audit_complete()
+        if auto_save and self._results and self.s_auto_save_var.get():
+            folder = self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
+            try:
+                path = self._write_report(folder)
+                self.status_var.set(
+                    self.status_var.get() + f"  |  Report saved: {os.path.basename(path)}"
+                )
+            except Exception as e:
+                messagebox.showerror("Auto-Save Failed", f"Could not save report:\n{e}")
+
+    # ── Report helpers ────────────────────────────────────────
+
+    _REPORT_HEADERS = [
+        "Original File", "New Name", "Status",
+        "Client", "Description", "Confidence",
+        "Extraction Method", "Renamed At", "Error",
+        "Moved To",
+        "Audit: Correct", "Audit: Wrong Client", "Audit: Bad Description",
+        "Audit: Failed to Identify Client", "Audit: Should Have Flagged",
+        "Audit: Corrected Name",
+    ]
+
+    def _results_as_rows(self) -> list:
+        rows = []
+        for r in self._results:
+            rows.append([
+                r.original_name, r.final_name, r.status,
+                r.client, r.description, r.confidence,
+                r.extraction_method, r.renamed_at or "", r.error_message or "",
+                r.moved_to,
+                "Yes" if r.audit_correct         else "",
+                "Yes" if r.audit_wrong_client    else "",
+                "Yes" if r.audit_bad_description else "",
+                "Yes" if r.audit_failed_client   else "",
+                "Yes" if r.audit_should_review   else "",
+                r.audit_corrected_name,
+            ])
+        # Summary row
+        total      = len(self._results)
+        renamed    = sum(1 for r in self._results if r.status == "renamed")
+        flagged    = sum(1 for r in self._results if r.status == "needs_review")
+        moved      = sum(1 for r in self._results if r.moved_to)
+        correct    = sum(1 for r in self._results if r.audit_correct)
+        wrong_cl   = sum(1 for r in self._results if r.audit_wrong_client)
+        bad_desc   = sum(1 for r in self._results if r.audit_bad_description)
+        failed_cl  = sum(1 for r in self._results if r.audit_failed_client)
+        sh_review  = sum(1 for r in self._results if r.audit_should_review)
+        rows.append([])   # blank separator
+        rows.append([
+            "SUMMARY", "", "",
+            f"Total: {total}", f"Renamed: {renamed}", f"Auto-flagged: {flagged}",
+            "", "", "",
+            f"Moved: {moved}",
+            f"Confirmed correct: {correct}",
+            f"Wrong client: {wrong_cl}",
+            f"Bad description: {bad_desc}",
+            f"Failed to identify client: {failed_cl}",
+            f"Should have flagged: {sh_review}",
+            "",
+        ])
+        return rows
+
+    @staticmethod
+    def _save_xlsx(path: str, headers: list, rows: list):
+        """Write an Excel workbook with auto-fitted columns and a styled header row.
+        Rows where 'Audit: Wrong Client' is 'Yes' are highlighted in red — these
+        are the most critical errors and must be easy to spot."""
+        wb = openpyxl.Workbook()
+        ws = wb.active
+        ws.title = "Results"
+
+        # Locate the "Audit: Wrong Client" column index (0-based in the data row)
+        try:
+            wrong_client_idx = headers.index("Audit: Wrong Client")
+        except ValueError:
+            wrong_client_idx = -1
+
+        # Header row
+        ws.append(headers)
+        header_fill = PatternFill("solid", fgColor="1F497D")
+        for cell in ws[1]:
+            cell.font = Font(bold=True, color="FFFFFF")
+            cell.fill = header_fill
+            cell.alignment = Alignment(horizontal="center", vertical="center")
+        ws.row_dimensions[1].height = 18
+
+        # Fill styles
+        light     = PatternFill("solid", fgColor="EEF2F7")
+        red_fill  = PatternFill("solid", fgColor="FFCCCC")  # wrong-client flag
+        red_font  = Font(bold=True, color="990000")
+
+        for i, row in enumerate(rows, start=2):
+            ws.append(row)
+            # Detect wrong-client flag
+            is_wrong_client = (
+                wrong_client_idx >= 0
+                and len(row) > wrong_client_idx
+                and row[wrong_client_idx] == "Yes"
+            )
+            if is_wrong_client:
+                for cell in ws[i]:
+                    cell.fill = red_fill
+                    cell.font = red_font
+            elif i % 2 == 0:
+                for cell in ws[i]:
+                    cell.fill = light
+
+        # Auto-fit column widths (cap between 12 and 60 chars wide)
+        for col in ws.columns:
+            max_len = max((len(str(cell.value or "")) for cell in col), default=10)
+            letter = col[0].column_letter
+            ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 60)
+
+        ws.freeze_panes = "A2"  # keep header visible while scrolling
+        wb.save(path)
+
+    @staticmethod
+    def _save_csv(path: str, headers: list, rows: list):
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            w = csv.writer(f)
+            w.writerow(headers)
+            for row in rows:
+                w.writerow(row)
+
+    def _write_report(self, folder: str) -> str:
+        """Write results to a timestamped report in `folder`. Returns the saved path."""
+        os.makedirs(folder, exist_ok=True)
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        headers = self._REPORT_HEADERS
+        rows = self._results_as_rows()
+        if _XLSX_AVAILABLE:
+            path = os.path.join(folder, f"scandocs_report_{ts}.xlsx")
+            self._save_xlsx(path, headers, rows)
+        else:
+            path = os.path.join(folder, f"scandocs_report_{ts}.csv")
+            self._save_csv(path, headers, rows)
+        return path
+
+
+    def _add_result_row(self, result: ProcessResult):
+        tag = result.status
+        label = {
+            "renamed":      "OK",
+            "needs_review": "REVIEW",
+            "skipped":      "Skipped",
+            "error":        "ERROR",
+        }.get(result.status, result.status)
+
+        client_cell = result.client if result.client else (result.error_message or "")[:60]
+        iid = self.results_tree.insert(
+            "", tk.END,
+            values=(
+                "",   # audited checkmark — filled in by _on_audit_check
+                result.original_name,
+                result.final_name,
+                label,
+                client_cell,
+                result.confidence,
+                "",   # new_location — filled in by _fo_do_move
+            ),
+            tags=(tag,),
+        )
+        self._iid_to_result[iid] = result
+        self._results.append(result)
+        self.results_tree.yview_moveto(1.0)
+
+    # ── Audit helpers ─────────────────────────────────────────
+
+    @staticmethod
+    def _is_audited(result: ProcessResult) -> bool:
+        return (result.audit_correct or result.audit_wrong_client or
+                result.audit_bad_description or result.audit_failed_client or
+                result.audit_should_review)
+
+    def _audit_mode_on(self) -> bool:
+        return self.s_audit_mode_var.get()
+
+    def _apply_file_mode(self):
+        """Show or hide File Mode panels based on the master toggle and per-tab sub-settings."""
+        master_on = self.s_file_mode_var.get()
+        auto_on   = master_on and self.s_file_mode_auto_var.get()
+        manual_on = master_on and self.s_file_mode_manual_var.get()
+
+        # Show / hide the per-tab sub-checkboxes
+        if hasattr(self, "_file_mode_sub_frame"):
+            if master_on:
+                self._file_mode_sub_frame.grid()
+            else:
+                self._file_mode_sub_frame.grid_remove()
+
+        # Suggest Location and Auto-commit are always visible but permanently disabled (Coming Soon)
+
+        # Auto-Process tab — Move Files panel
+        if auto_on:
+            self.file_ops_panel.pack(fill=tk.X, padx=10, pady=(6, 10))
+        else:
+            self.file_ops_panel.pack_forget()
+
+        # Manual Entry tab — destination row
+        if hasattr(self, "_review_dest_widgets"):
+            for w in self._review_dest_widgets:
+                if manual_on:
+                    w.grid()
+                else:
+                    w.grid_remove()
+
+    def _browse_suggest_parent(self):
+        folder = filedialog.askdirectory(
+            title="Select Client Folders Parent Directory",
+            initialdir=self.s_suggest_parent_var.get() or SCRIPT_DIR,
+        )
+        if folder:
+            self.s_suggest_parent_var.set(os.path.normpath(folder))
+
+    @staticmethod
+    def _suggest_location(client: str, description: str, parent_folder: str) -> Optional[str]:
+        """Find the single client folder in parent_folder that matches client, then pick
+        the best subfolder based on the document description.
+        Returns a path string, or None if no unambiguous match is found.
+        """
+        if not client or not parent_folder or not os.path.isdir(parent_folder):
+            return None
+
+        try:
+            all_dirs = [
+                d for d in os.listdir(parent_folder)
+                if os.path.isdir(os.path.join(parent_folder, d))
+            ]
+        except Exception as e:
+            logging.warning(f"Suggest location: could not list {parent_folder}: {e}")
+            return None
+
+        # Match the client name against folder names — look for the last name
+        # (before the comma) plus partial first name to avoid false positives
+        client_lower = client.lower()
+        last_name = client.split(",")[0].strip().lower()
+        first_part = client.split(",")[1].strip().lower().split()[0] if "," in client else ""
+
+        matching_dirs = []
+        for d in all_dirs:
+            d_lower = d.lower()
+            # Must contain the last name
+            if last_name not in d_lower:
+                continue
+            # If we have a first name part, folder should contain it too
+            if first_part and first_part not in d_lower:
+                continue
+            # Fuzzy fallback: ratio against the full client name
+            ratio = difflib.SequenceMatcher(None, client_lower, d_lower).ratio()
+            if ratio >= 0.7 or (last_name in d_lower and (not first_part or first_part in d_lower)):
+                matching_dirs.append(d)
+
+        if len(matching_dirs) != 1:
+            # 0 matches → no folder found; 2+ matches → ambiguous, don't guess
+            logging.debug(
+                f"Suggest location: {len(matching_dirs)} matches for '{client}' "
+                f"in {parent_folder} — skipping"
+            )
+            return None
+
+        client_folder = os.path.join(parent_folder, matching_dirs[0])
+
+        # Look for best subfolder using description keywords
+        try:
+            subfolders = [
+                d for d in os.listdir(client_folder)
+                if os.path.isdir(os.path.join(client_folder, d))
+            ]
+        except Exception:
+            return client_folder
+
+        if not subfolders:
+            return client_folder
+
+        desc_words = [w.lower() for w in re.split(r"\W+", description) if len(w) >= 3]
+        if not desc_words:
+            return client_folder
+
+        best_sub = None
+        best_score = 0
+        for sub in subfolders:
+            sub_lower = sub.lower()
+            score = sum(1 for w in desc_words if w in sub_lower)
+            if score > best_score:
+                best_score = score
+                best_sub = sub
+
+        if best_sub and best_score >= 1:
+            return os.path.join(client_folder, best_sub)
+        return client_folder
+
+    def _fo_browse_dest(self):
+        folder = filedialog.askdirectory(
+            title="Select Destination Folder",
+            initialdir=self.fo_dest_var.get() or SCRIPT_DIR,
+        )
+        if folder:
+            self.fo_dest_var.set(os.path.normpath(folder))
+            # Persist immediately
+            cfg = self.config_mgr.config
+            cfg["processing"]["file_mode_destination"] = self.fo_dest_var.get()
+            self.config_mgr.save(cfg)
+
+    def _fo_resolve_dest(self) -> str | None:
+        """Return the destination path if valid, else show an error and return None."""
+        dest = self.fo_dest_var.get().strip()
+        if not dest:
+            messagebox.showwarning(
+                "No Destination",
+                "Please select a destination folder before moving files."
+            )
+            return None
+        if not os.path.isdir(dest):
+            create = messagebox.askyesno(
+                "Folder Not Found",
+                f"The destination folder does not exist:\n{dest}\n\nCreate it?",
+            )
+            if not create:
+                return None
+            try:
+                os.makedirs(dest, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not create folder:\n{e}")
+                return None
+        return dest
+
+    def _fo_do_move(self, result: ProcessResult, dest: str, iid: str) -> bool:
+        """Move a single file to dest. Returns True on success."""
+        if not os.path.isdir(dest):
+            try:
+                os.makedirs(dest, exist_ok=True)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not create destination folder:\n{e}")
+                return False
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        src = os.path.join(scandocs, result.final_name)
+        if not os.path.isfile(src):
+            messagebox.showwarning(
+                "File Not Found",
+                f"Could not locate:\n{result.final_name}\n\n"
+                "It may have already been moved or renamed."
+            )
+            return False
+        # Collision avoidance at destination
+        dst_name = result.final_name
+        base, ext = os.path.splitext(dst_name)
+        counter = 1
+        dst = os.path.join(dest, dst_name)
+        while os.path.exists(dst):
+            dst_name = f"{base} ({counter}){ext}"
+            dst = os.path.join(dest, dst_name)
+            counter += 1
+        try:
+            import shutil
+            shutil.move(src, dst)
+            result.moved_to = dst
+            # Update the New Location column (index 6) in the treeview row
+            vals = list(self.results_tree.item(iid, "values"))
+            vals[6] = os.path.basename(dest)
+            self.results_tree.item(iid, values=vals, tags=("moved",))
+            return True
+        except Exception as e:
+            messagebox.showerror("Move Failed", f"Could not move file:\n{e}")
+            return False
+
+    def _fo_apply_to_selected(self):
+        """Stage the current destination for all selected rows without moving them yet.
+        The staged location is shown in the New Location column as '(pending)'."""
+        dest = self.fo_dest_var.get().strip()
+        if not dest:
+            self.fo_status_var.set("Set a destination folder first.")
+            return
+        sel = self.results_tree.selection()
+        if not sel:
+            self.fo_status_var.set("Select one or more files first.")
+            return
+        folder_label = os.path.basename(dest) or dest
+        audit_on = self._audit_mode_on()
+        count = 0
+        skipped_audit = 0
+        for iid in sel:
+            result = self._iid_to_result.get(iid)
+            if result and result.status == "renamed" and not result.moved_to:
+                # In audit mode a file must be marked Correct before it can be moved
+                if audit_on and not result.audit_correct:
+                    skipped_audit += 1
+                    continue
+                result.pending_dest = dest
+                vals = list(self.results_tree.item(iid, "values"))
+                vals[6] = f"{folder_label} (pending)"
+                self.results_tree.item(iid, values=vals)
+                count += 1
+        if count:
+            msg = f"{count} file{'s' if count != 1 else ''} staged — click Move Files to commit."
+            if skipped_audit:
+                msg += f"  ({skipped_audit} skipped — not marked Correct in audit.)"
+            self.fo_status_var.set(msg)
+        else:
+            if skipped_audit:
+                self.fo_status_var.set(
+                    f"No files staged — {skipped_audit} file(s) must be marked Correct in audit first.")
+            else:
+                self.fo_status_var.set(
+                    "No eligible files selected (files must be renamed and not yet moved).")
+
+    def _fo_move_all(self):
+        """Move all files that have been staged via Apply to Selected.
+        In audit mode, only files marked Correct are eligible."""
+        audit_on = self._audit_mode_on()
+        moveable = [
+            (iid, r) for iid, r in self._iid_to_result.items()
+            if r.status == "renamed" and not r.moved_to and r.pending_dest
+            and (not audit_on or r.audit_correct)
+        ]
+        if not moveable:
+            self.fo_status_var.set("No files staged — select files and click Apply to Selected first.")
+            return
+        moved, failed = 0, 0
+        for iid, result in moveable:
+            if self._fo_do_move(result, result.pending_dest, iid):
+                moved += 1
+            else:
+                failed += 1
+        msg = f"Moved {moved} file{'s' if moved != 1 else ''}."
+        if failed:
+            msg += f"  {failed} failed."
+        self.fo_status_var.set(msg)
+
+    # ── Palette & rounding ────────────────────────────────────────────────────
+
+    def _apply_default_styling(self):
+        """Apply fixed default blue styling across all UI elements."""
+        s = self.style
+        primary = _APP_PRIMARY
+        light   = _APP_LIGHT
+        mid     = _APP_MID
+
+        # Primary buttons
+        s.configure("primary.TButton",
+            background=primary, bordercolor=primary,
+            darkcolor=primary,  lightcolor=primary,
+            foreground="#ffffff",
+        )
+        s.map("primary.TButton",
+            background=[("active !disabled", mid),
+                        ("pressed !disabled", primary),
+                        ("disabled", "#cccccc")],
+            bordercolor=[("active !disabled", mid),
+                         ("focus !disabled", mid)],
+            darkcolor=[("active !disabled", mid),
+                       ("pressed !disabled", primary)],
+            lightcolor=[("active !disabled", mid),
+                        ("pressed !disabled", primary)],
+        )
+
+        # Outline buttons
+        s.configure("primary-outline.TButton",
+            foreground=primary, bordercolor=primary,
+        )
+        s.map("primary-outline.TButton",
+            background=[("active !disabled", light)],
+            foreground=[("active !disabled", primary)],
+        )
+
+        # Progressbar
+        s.configure("primary.Horizontal.TProgressbar",
+            troughcolor="#e0e0e0", background=primary)
+        s.configure("Horizontal.TProgressbar",
+            troughcolor="#e0e0e0", background=primary)
+
+        # Entry & Combobox focus highlight
+        s.map("TEntry",
+            bordercolor=[("focus !disabled", primary), ("hover !disabled", mid)],
+            lightcolor=[("focus !disabled", light)],
+            darkcolor=[("focus !disabled", light)],
+        )
+        s.map("TCombobox",
+            bordercolor=[("focus !disabled", primary), ("hover !disabled", mid)],
+            lightcolor=[("focus !disabled", light)],
+        )
+
+        # Notebook active tab
+        s.map("TNotebook.Tab",
+            background=[("selected", light), ("active", "#f8f9fa")],
+            foreground=[("selected", primary)],
+        )
+
+        # LabelFrame title
+        s.configure("TLabelframe.Label", foreground=primary)
+
+        # Checkbutton / Radiobutton indicators
+        s.map("TCheckbutton",  indicatorcolor=[("selected", primary)])
+        s.map("Checkbutton",   indicatorcolor=[("selected", primary)])
+        s.map("TRadiobutton",  indicatorcolor=[("selected", primary)])
+
+        # Scrollbar thumb
+        s.configure("Vertical.TScrollbar",   troughcolor="#f0f0f0", background=mid)
+        s.configure("Horizontal.TScrollbar", troughcolor="#f0f0f0", background=mid)
+
+    def _apply_round_styling(self):
+        """Apply soft visual tweaks: padded entries/tabs and DWM rounded window corners."""
+        s = self.style
+
+        s.configure("TEntry",        padding=[8, 6])
+        s.configure("TCombobox",     padding=[8, 6])
+        s.configure("TNotebook.Tab", padding=[14, 6])
+        s.configure("TButton",       padding=[10, 6])
+
+        self._apply_default_styling()
+
+        # Rounded window corners (Windows 11 DWM — silent no-op elsewhere)
+        self.after(200, self._try_round_window)
+
+    # ── Scroll helper ─────────────────────────────────────────
+
+    @staticmethod
+    def _bind_mousewheel(widget, scroll_fn):
+        """Recursively bind mousewheel/trackpad scroll to widget and all descendants."""
+        widget.bind("<MouseWheel>",  lambda e: scroll_fn(e), add="+")
+        widget.bind("<Button-4>",    lambda e: scroll_fn(e), add="+")  # Linux scroll-up
+        widget.bind("<Button-5>",    lambda e: scroll_fn(e), add="+")  # Linux scroll-down
+        for child in widget.winfo_children():
+            ScandocsApp._bind_mousewheel(child, scroll_fn)
+
+    def _try_round_window(self):
+        """Ask Windows 11 DWM to use rounded window corners."""
+        try:
+            import ctypes
+            DWMWA_WINDOW_CORNER_PREFERENCE = 33
+            DWMWCP_ROUND = 2
+            hwnd = self.winfo_id()
+            ctypes.windll.dwmapi.DwmSetWindowAttribute(
+                hwnd,
+                DWMWA_WINDOW_CORNER_PREFERENCE,
+                ctypes.byref(ctypes.c_int(DWMWCP_ROUND)),
+                ctypes.sizeof(ctypes.c_int))
+        except Exception:
+            pass  # Not Windows 11 or DWM unavailable — ignore
+
+    def _apply_audit_mode(self):
+        """Show or hide all audit UI based on the current Audit Mode setting."""
+        on = self._audit_mode_on()
+        # ✓ column in treeview
+        if on:
+            self.results_tree["displaycolumns"] = (
+                "audited", "original", "new_name", "status", "client", "confidence",
+                "new_location")
+        else:
+            self.results_tree["displaycolumns"] = (
+                "original", "new_name", "status", "client", "confidence",
+                "new_location")
+        # Audit panel
+        if on:
+            self.audit_panel.pack(fill=tk.X, padx=10, pady=(6, 0))
+        else:
+            self.audit_panel.pack_forget()
+        # Top-right button: Submit Audit in audit mode, Open Report otherwise
+        if on:
+            self.btn_open_report.pack_forget()
+            self.btn_submit_audit.pack(anchor="e")
+        else:
+            self.btn_submit_audit.pack_forget()
+            self.btn_open_report.pack(anchor="e")
+
+    def _check_audit_complete(self):
+        """If all auditable rows are reviewed AND processing is done, prompt to submit."""
+        if not self._audit_mode_on() or not self._results:
+            return
+        if getattr(self, "_processing_active", False):
+            return  # Still processing — re-checked automatically when processing finishes
+        auditable = [r for r in self._results if r.status in ("renamed", "needs_review")]
+        if not auditable:
+            return
+        if all(self._is_audited(r) for r in auditable):
+            folder = self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
+            try:
+                self._write_report(folder)
+            except Exception as e:
+                messagebox.showerror("Report Error", f"Could not save report:\n{e}")
+                return
+            # Disable the submit button so it can't be double-submitted via auto-path
+            self.btn_submit_audit.config(state=tk.DISABLED, text="Audit Saved")
+            # Custom prompt — two explicit choices instead of a plain showinfo
+            dlg = tk.Toplevel(self)
+            dlg.title("Audit Complete")
+            dlg.resizable(False, False)
+            dlg.transient(self)
+            dlg.grab_set()
+            # Centre over the main window
+            self.update_idletasks()
+            x = self.winfo_x() + (self.winfo_width() - 380) // 2
+            y = self.winfo_y() + (self.winfo_height() - 150) // 2
+            dlg.geometry(f"380x150+{x}+{y}")
+            ttk.Label(
+                dlg,
+                text="You finished the audit.\nWould you like to submit the audit now?",
+                font=("Segoe UI", 11),
+                anchor="center",
+                justify="center",
+            ).pack(pady=(24, 16))
+            btn_row = ttk.Frame(dlg)
+            btn_row.pack()
+            def _do_submit():
+                dlg.destroy()
+                self.btn_submit_audit.config(state=tk.NORMAL, text="Submit Audit")
+                self._submit_audit()
+            def _make_changes():
+                dlg.destroy()
+                self.btn_submit_audit.config(state=tk.NORMAL, text="Submit Audit")
+            ttk.Button(btn_row, text="Submit Audit", bootstyle="primary",
+                       command=_do_submit).pack(side=tk.LEFT, padx=(0, 12))
+            ttk.Button(btn_row, text="Make Changes", bootstyle="secondary-outline",
+                       command=_make_changes).pack(side=tk.LEFT)
+
+    def _on_close(self):
+        """Warn if audit mode is on and items are still unreviewed."""
+        if self._audit_mode_on() and self._results:
+            auditable = [r for r in self._results
+                         if r.status in ("renamed", "needs_review")]
+            unreviewed = [r for r in auditable if not self._is_audited(r)]
+            if unreviewed:
+                n = len(unreviewed)
+                answer = messagebox.askyesno(
+                    "Audit Incomplete",
+                    f"{n} file{'s' if n != 1 else ''} still "
+                    f"{'have' if n != 1 else 'has'} not been audited.\n\n"
+                    "You should complete the audit before closing so the report\n"
+                    "includes accurate quality data.\n\n"
+                    "Close anyway?",
+                    icon="warning",
+                )
+                if not answer:
+                    return
+        self.destroy()
+
+    def _sort_treeview(self, col: str):
+        """Sort the results treeview by *col*, toggling A→Z / Z→A on repeated clicks."""
+        col_index = {
+            "audited": 0, "original": 1, "new_name": 2,
+            "status": 3, "client": 4, "confidence": 5, "new_location": 6,
+        }
+        col_labels = {
+            "audited": "✓", "original": "Original File", "new_name": "New Name",
+            "status": "Status", "client": "Client",
+            "confidence": "Confidence", "new_location": "New Location",
+        }
+        sortable = {"original", "new_name", "status", "client"}
+
+        if self._sort_col == col:
+            self._sort_reverse = not self._sort_reverse
+        else:
+            self._sort_col = col
+            self._sort_reverse = False
+
+        idx = col_index[col]
+        items = [(self.results_tree.item(iid, "values"), iid)
+                 for iid in self.results_tree.get_children()]
+        items.sort(key=lambda x: (x[0][idx] or "").lower(),
+                   reverse=self._sort_reverse)
+        for i, (_, iid) in enumerate(items):
+            self.results_tree.move(iid, "", i)
+
+        # Update heading arrows
+        arrow = " ↓" if self._sort_reverse else " ↑"
+        for c, lbl in col_labels.items():
+            if c not in sortable:
+                continue
+            self.results_tree.heading(
+                c, text=lbl + (arrow if c == col else ""),
+                command=lambda _c=c: self._sort_treeview(_c))
+
+    def _on_result_select(self, _event=None):
+        """Update the audit panel when the user selects a row."""
+        sel = self.results_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        result = self._iid_to_result.get(iid)
+        if not result:
+            return
+
+        # Update file label
+        self.audit_file_label.config(
+            text=result.final_name or result.original_name, foreground="#212529"
+        )
+        # Enable controls
+        for w in (self.audit_open_btn, self.audit_prev_btn, self.audit_next_btn,
+                  self.audit_correct_chk, self.audit_wrong_client_chk,
+                  self.audit_bad_desc_chk, self.audit_failed_client_chk,
+                  self.audit_should_flag_chk):
+            w.config(state=tk.NORMAL)
+
+        # Sync checkboxes without triggering callbacks
+        self._audit_updating = True
+        self.audit_correct_var.set(result.audit_correct)
+        self.audit_wrong_client_var.set(result.audit_wrong_client)
+        self.audit_bad_desc_var.set(result.audit_bad_description)
+        self.audit_failed_client_var.set(result.audit_failed_client)
+        self.audit_should_flag_var.set(result.audit_should_review)
+        self._audit_updating = False
+
+        # Sync the rename hint
+        self._update_audit_rename_hint(result)
+
+        # If the preview popup is open, refresh it with the newly selected file
+        if self._file_popup is not None and self._file_popup.winfo_exists():
+            scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+            path = os.path.join(scandocs, result.final_name)
+            if not os.path.isfile(path):
+                path = os.path.join(scandocs, result.original_name)
+            if os.path.isfile(path):
+                self._refresh_popup_content(path)
+
+
+    def _audit_open_file(self):
+        """Open the currently selected file in a popup viewer."""
+        sel = self.results_tree.selection()
+        if not sel:
+            return
+        result = self._iid_to_result.get(sel[0])
+        if not result:
+            return
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        path = os.path.join(scandocs, result.final_name)
+        if not os.path.isfile(path):
+            path = os.path.join(scandocs, result.original_name)
+        if os.path.isfile(path):
+            self._open_file_popup(path)
+        else:
+            messagebox.showwarning("File Not Found",
+                f"Could not locate the file:\n{result.final_name}")
+
+    def _update_audit_rename_hint(self, result: ProcessResult):
+        """Update the italic rename-hint label below the audit checkboxes.
+        Wrong client name → client portion becomes A-NEEDS REVIEW.
+        Bad description   → description portion becomes Scanned Document.
+        Both flags can apply simultaneously."""
+        any_bad = (result.audit_wrong_client or result.audit_bad_description
+                   or result.audit_failed_client or result.audit_should_review)
+        if not any_bad:
+            self.audit_rename_hint_var.set("")
+            return
+
+        fname = result.final_name
+        base, ext = os.path.splitext(fname)
+        if " - " in base:
+            orig_client, orig_desc = base.split(" - ", 1)
+        else:
+            orig_client, orig_desc = base, ""
+
+        # Which part changes?
+        client_bad = result.audit_wrong_client or result.audit_failed_client or result.audit_should_review
+        new_client = "A-NEEDS REVIEW" if client_bad else orig_client
+        new_desc   = "Scanned Document" if result.audit_bad_description else orig_desc
+
+        proposed = f"{new_client} - {new_desc}{ext}" if new_desc else f"{new_client}{ext}"
+        self.audit_rename_hint_var.set(
+            f"This document will be renamed \"{proposed}\" after the audit is complete.")
+
+    def _on_audit_check(self, flag: str):
+        """Called when an audit checkbox is toggled."""
+        if self._audit_updating:
+            return
+        sel = self.results_tree.selection()
+        if not sel:
+            return
+        iid = sel[0]
+        result = self._iid_to_result.get(iid)
+        if not result:
+            return
+
+        if flag == "correct":
+            result.audit_correct = self.audit_correct_var.get()
+            # Correct is mutually exclusive with all problem flags — clear them
+            if result.audit_correct:
+                result.audit_wrong_client    = False
+                result.audit_bad_description = False
+                result.audit_failed_client   = False
+                result.audit_should_review   = False
+                self._audit_updating = True
+                self.audit_wrong_client_var.set(False)
+                self.audit_bad_desc_var.set(False)
+                self.audit_failed_client_var.set(False)
+                self.audit_should_flag_var.set(False)
+                self._audit_updating = False
+        elif flag == "wrong_client":
+            result.audit_wrong_client = self.audit_wrong_client_var.get()
+        elif flag == "bad_description":
+            result.audit_bad_description = self.audit_bad_desc_var.get()
+        elif flag == "failed_client":
+            result.audit_failed_client = self.audit_failed_client_var.get()
+        elif flag == "should_review":
+            result.audit_should_review = self.audit_should_flag_var.get()
+
+        # Orange if any problem flag set; keep green if marked correct; else original
+        any_flagged = (result.audit_wrong_client or result.audit_bad_description
+                       or result.audit_failed_client or result.audit_should_review)
+        if any_flagged:
+            tags = ("audited",)
+        elif result.audit_correct:
+            tags = ("renamed",)
+        else:
+            tags = (result.status,)
+        self.results_tree.item(iid, tags=tags)
+
+        # Update the ✓ column
+        is_audited = self._is_audited(result)
+        vals = list(self.results_tree.item(iid, "values"))
+        vals[0] = "✓" if is_audited else ""
+        self.results_tree.item(iid, values=vals)
+
+        # Check if all auditable rows are now done
+        self._check_audit_complete()
+
+        # Update the rename hint below the checkboxes
+        self._update_audit_rename_hint(result)
+
+    def _show_correction_dialog(self, iid: str, result: ProcessResult):
+        """Modal dialog asking the employee what the file should be named."""
+        dialog = tk.Toplevel(self)
+        dialog.title("Correct File Name")
+        dialog.resizable(False, False)
+        dialog.grab_set()   # modal
+        dialog.focus_set()
+
+        # Centre over the main window
+        self.update_idletasks()
+        x = self.winfo_x() + self.winfo_width()  // 2 - 260
+        y = self.winfo_y() + self.winfo_height() // 2 - 80
+        dialog.geometry(f"520x160+{x}+{y}")
+
+        ttk.Label(dialog, text="What should this file be named?",
+                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
+        ttk.Label(dialog, text="Include the file extension  (e.g. GARCIA, Maria - Invoice.pdf)",
+                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w", padx=16)
+
+        entry_var = tk.StringVar(value=result.audit_corrected_name or result.final_name)
+        entry = ttk.Entry(dialog, textvariable=entry_var, width=62)
+        entry.pack(padx=16, pady=(6, 0), fill=tk.X)
+        entry.select_range(0, tk.END)
+        entry.focus_set()
+
+        def _submit():
+            corrected = entry_var.get().strip()
+            if corrected:
+                result.audit_corrected_name = corrected
+                # Update the New Name cell in the treeview to show the correction
+                vals = list(self.results_tree.item(iid, "values"))
+                vals[1] = f"{corrected}  ✎"
+                self.results_tree.item(iid, values=vals)
+            dialog.destroy()
+
+        def _cancel():
+            # Uncheck whichever box triggered this if no correction was previously saved
+            if not result.audit_corrected_name:
+                self._audit_updating = True
+                if result.audit_wrong_client and not self.audit_bad_desc_var.get():
+                    self.audit_wrong_client_var.set(False)
+                    result.audit_wrong_client = False
+                elif result.audit_bad_description:
+                    self.audit_bad_desc_var.set(False)
+                    result.audit_bad_description = False
+                self._audit_updating = False
+                # Re-evaluate row colour
+                any_flagged = (result.audit_wrong_client or result.audit_bad_description
+                               or result.audit_should_review)
+                tags = ("audited",) if any_flagged else (result.status,)
+                self.results_tree.item(iid, tags=tags)
+            dialog.destroy()
+
+        btn_row = ttk.Frame(dialog)
+        btn_row.pack(pady=(10, 0))
+        ttk.Button(btn_row, text="Submit", bootstyle="primary",
+                   command=_submit).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row, text="Cancel", bootstyle="dark-outline",
+                   command=_cancel).pack(side=tk.LEFT, padx=6)
+
+        dialog.bind("<Return>", lambda e: _submit())
+        dialog.bind("<Escape>", lambda e: _cancel())
+        dialog.wait_window()
+
+    # ── Manual Entry navigation ───────────────────────────────
+
+    def _review_prev(self, _event=None):
+        """Move to the previous file in the Manual Entry list."""
+        n = self.review_listbox.size()
+        if n == 0:
+            return
+        sel = self.review_listbox.curselection()
+        idx = (sel[0] - 1) if sel else n - 1
+        idx = max(idx, 0)
+        self.review_listbox.selection_clear(0, tk.END)
+        self.review_listbox.selection_set(idx)
+        self.review_listbox.see(idx)
+        self._on_review_select(None)
+
+    def _review_next(self, _event=None):
+        """Move to the next file in the Manual Entry list."""
+        n = self.review_listbox.size()
+        if n == 0:
+            return
+        sel = self.review_listbox.curselection()
+        idx = (sel[0] + 1) if sel else 0
+        idx = min(idx, n - 1)
+        self.review_listbox.selection_clear(0, tk.END)
+        self.review_listbox.selection_set(idx)
+        self.review_listbox.see(idx)
+        self._on_review_select(None)
+
+    # ── Audit navigation ──────────────────────────────────────
+
+    def _audit_prev(self, _event=None):
+        """Move selection to the previous row in the results tree."""
+        children = self.results_tree.get_children()
+        sel = self.results_tree.selection()
+        if not children:
+            return
+        if not sel:
+            self.results_tree.selection_set(children[-1])
+            self.results_tree.see(children[-1])
+        else:
+            idx = children.index(sel[0])
+            if idx > 0:
+                self.results_tree.selection_set(children[idx - 1])
+                self.results_tree.see(children[idx - 1])
+
+    def _audit_next(self, _event=None):
+        """Move selection to the next row in the results tree."""
+        children = self.results_tree.get_children()
+        sel = self.results_tree.selection()
+        if not children:
+            return
+        if not sel:
+            self.results_tree.selection_set(children[0])
+            self.results_tree.see(children[0])
+        else:
+            idx = children.index(sel[0])
+            if idx < len(children) - 1:
+                self.results_tree.selection_set(children[idx + 1])
+                self.results_tree.see(children[idx + 1])
+
+    # ── File popup viewer ─────────────────────────────────────
+
+    # ── Document popup viewer ─────────────────────────────────
+
+    def _render_doc_image(self, path: str):
+        """Render up to the first three PDF pages (or a JPEG) into a single PIL image.
+        Returns None on any error so callers can fall back gracefully."""
+        ext = os.path.splitext(path)[1].lower()
+        try:
+            import io
+            if ext == ".pdf":
+                doc = fitz.open(path)
+                mat = fitz.Matrix(1.5, 1.5)
+                n = min(doc.page_count, 3)
+                imgs = [
+                    PILImage.open(io.BytesIO(doc[i].get_pixmap(matrix=mat).tobytes("png")))
+                    for i in range(n)
+                ]
+                doc.close()
+                if len(imgs) == 1:
+                    return imgs[0]
+                # Stack pages vertically with a light-grey gap
+                gap = 8
+                w = max(p.width  for p in imgs)
+                h = sum(p.height for p in imgs) + gap
+                combined = PILImage.new("RGB", (w, h), color=(200, 200, 200))
+                y = 0
+                for p in imgs:
+                    combined.paste(p, (0, y))
+                    y += p.height + gap
+                return combined
+            elif ext in (".jpg", ".jpeg"):
+                return PILImage.open(path)
+        except Exception as e:
+            logging.warning(f"Could not render {path}: {e}")
+        return None
+
+    def _open_file_popup(self, path: str):
+        """Open the preview popup for *path*.
+        If the popup is already visible, refresh its content instead of opening a second window."""
+        if fitz is None or PILImage is None or PILImageTk is None:
+            _open_file(path)
+            return
+
+        img = self._render_doc_image(path)
+        if img is None:
+            _open_file(path)
+            return
+
+        # Reuse existing window if it is still open
+        if self._file_popup is not None and self._file_popup.winfo_exists():
+            self._refresh_popup_content(path, img)
+            return
+
+        # ── Create new popup ──────────────────────────────────
+        popup = tk.Toplevel(self)
+        popup.title(os.path.basename(path))
+        popup.resizable(True, True)
+
+        self.update_idletasks()
+        px = self.winfo_x() + self.winfo_width() + 8
+        py = self.winfo_y()
+        popup.geometry(f"{min(img.width + 20, 900)}x{min(img.height + 40, 860)}+{px}+{py}")
+
+        canvas = tk.Canvas(popup, bg="white")
+        vsb = ttk.Scrollbar(popup, orient="vertical",   command=canvas.yview)
+        hsb = ttk.Scrollbar(popup, orient="horizontal", command=canvas.xview)
+        canvas.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+        vsb.pack(side=tk.RIGHT,  fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        canvas.pack(fill=tk.BOTH, expand=True)
+
+        photo = PILImageTk.PhotoImage(img)
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas.configure(scrollregion=(0, 0, img.width, img.height))
+        canvas.image = photo
+
+        canvas.bind("<MouseWheel>",
+                    lambda e: canvas.yview_scroll(-1 * (e.delta // 120), "units"))
+
+        self._file_popup        = popup
+        self._file_popup_canvas = canvas
+
+        def _on_popup_close():
+            self._file_popup        = None
+            self._file_popup_canvas = None
+            popup.destroy()
+
+        popup.protocol("WM_DELETE_WINDOW", _on_popup_close)
+
+        # Arrow keys while the popup is focused still navigate the list
+        popup.bind("<Left>",  lambda e: (self._audit_prev()   if self.notebook.index("current") == 0
+                                         else self._review_prev()))
+        popup.bind("<Right>", lambda e: (self._audit_next()   if self.notebook.index("current") == 0
+                                         else self._review_next()))
+        popup.bind("<Up>",    lambda e: (self._audit_prev()   if self.notebook.index("current") == 0
+                                         else self._review_prev()))
+        popup.bind("<Down>",  lambda e: (self._audit_next()   if self.notebook.index("current") == 0
+                                         else self._review_next()))
+
+    def _refresh_popup_content(self, path: str, img=None):
+        """Swap the canvas image in the already-open popup for a new file."""
+        if self._file_popup is None or not self._file_popup.winfo_exists():
+            return
+        if img is None:
+            img = self._render_doc_image(path)
+        if img is None:
+            return
+        canvas = self._file_popup_canvas
+        photo  = PILImageTk.PhotoImage(img)
+        canvas.delete("all")
+        canvas.create_image(0, 0, anchor="nw", image=photo)
+        canvas.configure(scrollregion=(0, 0, img.width, img.height))
+        canvas.image = photo          # prevent GC
+        canvas.yview_moveto(0)        # scroll back to top for the new document
+        self._file_popup.title(os.path.basename(path))
+
+    def _toggle_file_popup(self, path: str):
+        """Open the popup if it is closed; close it if it is already open."""
+        if self._file_popup is not None and self._file_popup.winfo_exists():
+            self._file_popup.destroy()
+            self._file_popup        = None
+            self._file_popup_canvas = None
+        else:
+            self._open_file_popup(path)
+
+    def _on_tree_return(self, _event=None):
+        """Enter key on the Auto-Process results tree: toggle the file viewer."""
+        sel = self.results_tree.selection()
+        if not sel:
+            return "break"
+        result = self._iid_to_result.get(sel[0])
+        if not result:
+            return "break"
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        path = os.path.join(scandocs, result.final_name)
+        if not os.path.isfile(path):
+            path = os.path.join(scandocs, result.original_name)
+        if os.path.isfile(path):
+            self._toggle_file_popup(path)
+        return "break"   # prevent treeview default Enter behaviour
+
+    def _on_review_return(self, _event=None):
+        """Enter key on the Manual Entry list: toggle the file viewer."""
+        sel = self.review_listbox.curselection()
+        filename = (self.review_listbox.get(sel[0]) if sel
+                    else self._review_selected_file)
+        if not filename:
+            return "break"
+        path = os.path.join(
+            self.config_mgr.config["paths"]["scandocs_folder"], filename)
+        if os.path.isfile(path):
+            self._toggle_file_popup(path)
+        return "break"
+
+    def _on_tree_double_click(self, _event=None):
+        """Double-click on the Auto-Process results tree: always open the file viewer."""
+        sel = self.results_tree.selection()
+        if not sel:
+            return "break"
+        result = self._iid_to_result.get(sel[0])
+        if not result:
+            return "break"
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        path = os.path.join(scandocs, result.final_name)
+        if not os.path.isfile(path):
+            path = os.path.join(scandocs, result.original_name)
+        if os.path.isfile(path):
+            self._open_file_popup(path)
+        return "break"
+
+    def _on_review_double_click(self, _event=None):
+        """Double-click on the Manual Entry list: always open the file viewer."""
+        sel = self.review_listbox.curselection()
+        filename = (self.review_listbox.get(sel[0]) if sel
+                    else self._review_selected_file)
+        if not filename:
+            return "break"
+        path = os.path.join(
+            self.config_mgr.config["paths"]["scandocs_folder"], filename)
+        if os.path.isfile(path):
+            self._open_file_popup(path)
+        return "break"
+
+    # ── Submit Audit ──────────────────────────────────────────
+
+    def _submit_audit(self):
+        """Apply audit-flagged renames and save the report."""
+        if not self._results:
+            messagebox.showinfo("No Results", "No results to submit. Run processing first.")
+            return
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        errors = []
+
+        for result in self._results:
+            if result.status not in ("renamed", "needs_review"):
+                continue
+            if not (result.audit_wrong_client or result.audit_bad_description):
+                continue
+
+            current_name = result.final_name
+            base, ext = os.path.splitext(current_name)
+
+            # Determine new client segment
+            m = re.match(r"^(.+?) - (.+)$", base)
+            old_client = m.group(1) if m else base
+            old_desc   = m.group(2) if m else ""
+
+            new_client = "A-NEEDS REVIEW" if result.audit_wrong_client else old_client
+            new_desc   = "Scanned Document" if result.audit_bad_description else old_desc
+
+            new_name = f"{new_client} - {new_desc}{ext}" if old_desc else f"{new_client}{ext}"
+
+            if new_name == current_name:
+                continue
+
+            src = os.path.join(scandocs, current_name)
+            if os.path.isfile(src):
+                resolved = FileProcessor._resolve_collision(scandocs, new_name, current_name)
+                try:
+                    os.rename(src, os.path.join(scandocs, resolved))
+                    result.final_name = resolved
+                    result.audit_corrected_name = resolved
+                    # Refresh the treeview row
+                    for iid, r in self._iid_to_result.items():
+                        if r is result:
+                            vals = list(self.results_tree.item(iid, "values"))
+                            vals[2] = resolved
+                            self.results_tree.item(iid, values=vals)
+                            break
+                except Exception as e:
+                    errors.append(f"{current_name}: {e}")
+
+        # Save report
+        folder = self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
+        try:
+            path = self._write_report(folder)
+        except Exception as e:
+            messagebox.showerror("Report Error", f"Could not save report:\n{e}")
+            return
+
+        # Grey out the button so it can't be submitted twice
+        self.btn_submit_audit.config(state=tk.DISABLED, text="Audit Submitted ✓")
+
+        msg = f"Audit submitted.\nReport saved to:\n{os.path.basename(path)}"
+        if errors:
+            msg += f"\n\nWarnings ({len(errors)}):\n" + "\n".join(errors[:5])
+        messagebox.showinfo("Audit Submitted", msg)
+        self._refresh_review_tab()
+
+    # ── Client combo filter ───────────────────────────────────
+
+    def _filter_client_combo(self, _event=None):
+        """Filter the visible client list as the user types in the entry field."""
+        typed = self.review_client_var.get().lower()
+        self.review_client_listbox.delete(0, tk.END)
+        for name in self._all_clients:
+            if not typed or typed in name.lower():
+                self.review_client_listbox.insert(tk.END, name)
+
+    def _on_client_listbox_select(self, _event=None):
+        """Clicking a name in the client list copies it to the entry field."""
+        sel = self.review_client_listbox.curselection()
+        if sel:
+            self.review_client_var.set(self.review_client_listbox.get(sel[0]))
+
+    def _open_report(self):
+        folder = self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
+        if not os.path.isdir(folder):
+            messagebox.showinfo("No Reports", f"Reports folder not found:\n{folder}")
+            return
+        reports = sorted(
+            [f for f in os.listdir(folder)
+             if f.lower().endswith(".xlsx") or f.lower().endswith(".csv")],
+            reverse=True,
+        )
+        if not reports:
+            messagebox.showinfo(
+                "No Reports",
+                f"No reports found in:\n{folder}\n\nProcess some documents first.",
+            )
+            return
+        os.startfile(os.path.join(folder, reports[0]))
+
+    def _export_csv(self):
+        if not self._results:
+            messagebox.showinfo("No Data", "No results to export. Run processing first.")
+            return
+        ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
+        init_dir = self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
+        if _XLSX_AVAILABLE:
+            default_ext = ".xlsx"
+            filetypes = [("Excel files", "*.xlsx"), ("CSV files", "*.csv")]
+            default_name = f"scandocs_report_{ts}.xlsx"
+        else:
+            default_ext = ".csv"
+            filetypes = [("CSV files", "*.csv")]
+            default_name = f"scandocs_report_{ts}.csv"
+        path = filedialog.asksaveasfilename(
+            title="Save Report",
+            initialdir=init_dir,
+            initialfile=default_name,
+            defaultextension=default_ext,
+            filetypes=filetypes,
+        )
+        if not path:
+            return
+        try:
+            headers = self._REPORT_HEADERS
+            rows = self._results_as_rows()
+            if path.lower().endswith(".xlsx") and _XLSX_AVAILABLE:
+                self._save_xlsx(path, headers, rows)
+            else:
+                self._save_csv(path, headers, rows)
+            messagebox.showinfo("Exported", f"Report saved to:\n{path}")
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+
+    # ── First-run wizard ──────────────────────────────────────
+
+    def _check_first_run(self):
+        if not self.config_mgr.config["paths"]["scandocs_folder"]:
+            self._run_first_run_wizard()
+
+    def _run_first_run_wizard(self):
+        messagebox.showinfo(
+            "Welcome to Speedy Scandocs",
+            "Let's get you set up.\n\nFirst, select your Scandocs folder "
+            "(where the scanner drops files).",
+        )
+        scandocs = filedialog.askdirectory(title="Select Scandocs Folder")
+        if scandocs:
+            p = os.path.normpath(scandocs)
+            self.config_mgr.config["paths"]["scandocs_folder"] = p
+            self.s_scandocs_var.set(p)
+
+        messagebox.showinfo(
+            "Client List File",
+            "Now select your client_list.txt file, or choose a location to create one.\n\n"
+            "This file stores client names in LAST, First format.",
+        )
+        client_file = filedialog.asksaveasfilename(
+            title="Select or Create Client List",
+            initialfile="client_list.txt",
+            defaultextension=".txt",
+            filetypes=[("Text files", "*.txt")],
+        )
+        if client_file:
+            p = os.path.normpath(client_file)
+            self.config_mgr.config["paths"]["client_list_file"] = p
+            self.s_client_list_var.set(p)
+            if not os.path.exists(client_file):
+                open(client_file, "w").close()
+
+        self.config_mgr.save()
+        messagebox.showinfo(
+            "Setup Complete",
+            "Setup complete!\n\n"
+            "Next steps:\n"
+            "1. Go to the Client List tab → add your clients → Save.\n"
+            "2. Go to Settings → verify API URLs → Test Connection.\n"
+            "3. Return to Auto-Process → click Auto-Process Documents.",
+        )
+        self.notebook.select(3)  # open Settings tab
+
+
+# ─────────────────────────────────────────────────────────────
+# Entry point
+# ─────────────────────────────────────────────────────────────
+
+def _missing_dep_error(package: str):
+    root = tk.Tk()
+    root.withdraw()
+    messagebox.showerror(
+        "Missing Dependency",
+        f"{package} is not installed.\n\n"
+        "Please run:\n    pip install -r requirements.txt\n\n"
+        "Then restart Speedy Scandocs.",
+    )
+    sys.exit(1)
+
+
+if __name__ == "__main__":
+    logging.basicConfig(
+        filename=LOG_PATH,
+        level=logging.INFO,
+        format="%(asctime)s  %(levelname)-8s  %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+
+    if fitz is None:
+        _missing_dep_error("PyMuPDF")
+    if requests is None:
+        _missing_dep_error("requests")
+
+    app = ScandocsApp()
+    app.mainloop()
