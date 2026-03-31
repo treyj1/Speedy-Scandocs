@@ -1,7 +1,7 @@
 name: Build Speedy Scandocs
 
 # Trigger: push a version tag like v1.0 or v1.2.3
-# git tag v1.2 && git push --tags
+# git tag v1.3 && git push --tags
 on:
   push:
     tags:
@@ -33,10 +33,13 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller build/windows/scandocs.spec --clean -y
 
-      - name: Build Windows installer (Inno Setup)
+      - name: Install Inno Setup and build installer
         run: |
           choco install innosetup --yes --no-progress
-          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "build\windows\installer.iss"
+          $iscc = Get-ChildItem "C:\Program Files*\Inno Setup 6\ISCC.exe" | Select-Object -First 1
+          if (-not $iscc) { Write-Error "ISCC.exe not found"; exit 1 }
+          Write-Host "Using: $($iscc.FullName)"
+          & $iscc.FullName "build\windows\installer.iss"
         shell: pwsh
 
       - name: Upload Windows installer
@@ -48,7 +51,7 @@ jobs:
 
   # ── macOS build ──────────────────────────────────────────────────────────
   build-mac:
-    runs-on: macos-13       # Intel runner — app also runs on Apple Silicon via Rosetta 2
+    runs-on: macos-13
     steps:
       - uses: actions/checkout@v4
 
@@ -76,7 +79,6 @@ jobs:
         run: |
           create-dmg \
             --volname "Speedy Scandocs" \
-            --volicon "assets/GDJ Logo.png" \
             --window-pos 200 120 \
             --window-size 600 400 \
             --icon-size 100 \
@@ -115,6 +117,7 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          token: ${{ secrets.GITHUB_TOKEN }}
           name: "Speedy Scandocs ${{ github.ref_name }}"
           body: |
             ## Speedy Scandocs ${{ github.ref_name }}
