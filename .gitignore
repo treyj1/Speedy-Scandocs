@@ -16,6 +16,9 @@ Reports/
 dist/
 build/windows/Output/
 
+# Build virtual environment
+build/.venv/
+
 # Tesseract installer binary (too large for git — download separately)
 build/windows/Installers/*.exe
 

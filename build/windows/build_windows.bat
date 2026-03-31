@@ -15,10 +15,19 @@ cd /d "%~dp0..\.."
 
 echo.
 echo ════════════════════════════════════════════════════
-echo  Step 1: PyInstaller — bundling app
+echo  Step 1: Creating clean build environment
 echo ════════════════════════════════════════════════════
-python -m pip install -q pyinstaller
-pyinstaller "build\windows\scandocs.spec" --clean
+if not exist "build\.venv\Scripts\python.exe" (
+    python -m venv build\.venv
+)
+build\.venv\Scripts\pip install -q -r requirements.txt pyinstaller
+
+echo.
+echo ════════════════════════════════════════════════════
+echo  Step 2: PyInstaller — bundling app
+echo ════════════════════════════════════════════════════
+if exist "dist" rd /s /q dist
+build\.venv\Scripts\python -m PyInstaller "build\windows\scandocs.spec" --clean -y
 if errorlevel 1 (
     echo.
     echo ERROR: PyInstaller failed. See output above.
@@ -28,7 +37,7 @@ if errorlevel 1 (
 
 echo.
 echo ════════════════════════════════════════════════════
-echo  Step 2: Checking Tesseract installer
+echo  Step 3: Checking Tesseract installer
 echo ════════════════════════════════════════════════════
 if not exist "build\windows\Installers\tesseract-ocr-w64-setup.exe" (
     echo.
@@ -44,7 +53,7 @@ echo Tesseract installer found.
 
 echo.
 echo ════════════════════════════════════════════════════
-echo  Step 3: Inno Setup — creating installer wizard
+echo  Step 4: Inno Setup — creating installer wizard
 echo ════════════════════════════════════════════════════
 set ISCC="%LOCALAPPDATA%\Programs\Inno Setup 6\ISCC.exe"
 if not exist %ISCC% set ISCC="C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
