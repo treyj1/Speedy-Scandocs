@@ -1,7 +1,7 @@
 name: Build Speedy Scandocs
 
 # Trigger: push a version tag like v1.0 or v1.2.3
-# git tag v1.0 && git push --tags
+# git tag v1.2 && git push --tags
 on:
   push:
     tags:
@@ -20,6 +20,10 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Install Tesseract (needed to bundle into app)
+        run: choco install tesseract --yes --no-progress
+        shell: pwsh
+
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
@@ -27,14 +31,20 @@ jobs:
           pip install pyinstaller
 
       - name: Build with PyInstaller
-        run: pyinstaller build/windows/scandocs.spec --clean
+        run: pyinstaller build/windows/scandocs.spec --clean -y
 
-      - name: Upload Windows app folder
+      - name: Build Windows installer (Inno Setup)
+        run: |
+          choco install innosetup --yes --no-progress
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" "build\windows\installer.iss"
+        shell: pwsh
+
+      - name: Upload Windows installer
         uses: actions/upload-artifact@v4
         with:
-          name: SpeedyScandocs-Windows
-          path: dist/SpeedyScandocs/
-          retention-days: 30
+          name: SpeedyScandocs-Windows-Setup
+          path: build/windows/Output/SpeedyScandocsSetup.exe
+          retention-days: 90
 
   # ── macOS build ──────────────────────────────────────────────────────────
   build-mac:
@@ -57,7 +67,7 @@ jobs:
           pip install pyinstaller
 
       - name: Build with PyInstaller
-        run: pyinstaller build/mac/scandocs_mac.spec --clean
+        run: pyinstaller build/mac/scandocs_mac.spec --clean -y
 
       - name: Install create-dmg
         run: brew install create-dmg
@@ -81,4 +91,39 @@ jobs:
         with:
           name: SpeedyScandocs-Mac
           path: build/mac/SpeedyScandocs.dmg
-          retention-days: 30
+          retention-days: 90
+
+  # ── Publish GitHub Release with both files ───────────────────────────────
+  release:
+    needs: [build-windows, build-mac]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download Windows installer
+        uses: actions/download-artifact@v4
+        with:
+          name: SpeedyScandocs-Windows-Setup
+          path: release/
+
+      - name: Download macOS DMG
+        uses: actions/download-artifact@v4
+        with:
+          name: SpeedyScandocs-Mac
+          path: release/
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Speedy Scandocs ${{ github.ref_name }}"
+          body: |
+            ## Speedy Scandocs ${{ github.ref_name }}
+
+            ### Windows
+            Download and run **SpeedyScandocsSetup.exe** — standard installer wizard.
+
+            ### Mac
+            Download **SpeedyScandocs.dmg** — open it and drag the app to Applications.
+          files: |
+            release/SpeedyScandocsSetup.exe
+            release/SpeedyScandocs.dmg
