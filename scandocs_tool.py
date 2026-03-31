@@ -74,10 +74,15 @@ _APP_LIGHT     = "#e3f2fd"
 _APP_MID       = "#1976d2"
 
 # ── User-writable data directory ───────────────────────────────────────────
-# When installed to Program Files the app folder is read-only, so config,
-# logs, and reports are stored in %APPDATA%\SpeedyScandocs instead.
+# When installed to Program Files / Applications the app bundle is read-only,
+# so config, logs, and reports are stored in the platform user-data folder.
 if getattr(sys, "frozen", False):
-    _appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+    if sys.platform == "win32":
+        _appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+    elif sys.platform == "darwin":
+        _appdata = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
+    else:
+        _appdata = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
     _USER_DATA_DIR = os.path.join(_appdata, "SpeedyScandocs")
     os.makedirs(_USER_DATA_DIR, exist_ok=True)
     # Copy default client list on first run so the user can edit it
