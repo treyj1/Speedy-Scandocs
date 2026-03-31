@@ -5,8 +5,17 @@
 #
 
 import os
+import glob
 
-ROOT = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
+ROOT      = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
+TESS_ROOT = r'C:\Program Files\Tesseract-OCR'
+
+# Bundle Tesseract: exe + all DLLs + English language data only
+tess_datas = []
+tess_datas += [(os.path.join(TESS_ROOT, 'tesseract.exe'), 'Tesseract-OCR')]
+tess_datas += [(f, 'Tesseract-OCR') for f in glob.glob(os.path.join(TESS_ROOT, '*.dll'))]
+tess_datas += [(os.path.join(TESS_ROOT, 'tessdata', 'eng.traineddata'), 'Tesseract-OCR/tessdata')]
+tess_datas += [(os.path.join(TESS_ROOT, 'tessdata', 'osd.traineddata'), 'Tesseract-OCR/tessdata')]
 
 a = Analysis(
     [os.path.join(ROOT, 'scandocs_tool.py')],
@@ -15,7 +24,7 @@ a = Analysis(
     datas=[
         (os.path.join(ROOT, 'assets'),          'assets'),
         (os.path.join(ROOT, 'client_list.txt'), '.'),
-    ],
+    ] + tess_datas,
     hiddenimports=[
         'ttkbootstrap',
         'ttkbootstrap.themes',

@@ -42,8 +42,7 @@ Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{
 ; Main application (PyInstaller one-folder output)
 Source: "{#DistDir}\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
-; Tesseract installer — extracted to temp, run silently in [Run]
-Source: "Installers\tesseract-ocr-w64-setup.exe"; DestDir: "{tmp}"; Flags: deleteafterinstall
+; (Tesseract is bundled inside the PyInstaller app folder — no separate install needed)
 
 [Icons]
 Name: "{group}\{#AppName}";   Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\assets\GDJ Logo.ico"
@@ -51,14 +50,7 @@ Name: "{group}\Uninstall {#AppName}"; Filename: "{uninstallexe}"
 Name: "{autodesktop}\{#AppName}"; Filename: "{app}\{#AppExeName}"; IconFilename: "{app}\assets\GDJ Logo.ico"; Tasks: desktopicon
 
 [Run]
-; Install Tesseract silently BEFORE the app finishes installing
-Filename: "{tmp}\tesseract-ocr-w64-setup.exe"; Parameters: "/S"; \
-  Flags: waituntilterminated; StatusMsg: "Installing Tesseract OCR (required for document scanning)..."
-
 ; Offer to launch app when installer finishes
 Filename: "{app}\{#AppExeName}"; Description: "{cm:LaunchProgram,{#StringChange(AppName, '&', '&&')}}"; \
   Flags: nowait postinstall skipifsilent
 
-[UninstallRun]
-; Silently uninstall Tesseract when the app is uninstalled
-Filename: "{autopf64}\Tesseract-OCR\unins000.exe"; Parameters: "/S"; Flags: skipifdoesntexist waituntilterminated

@@ -72,15 +72,32 @@ ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 _APP_PRIMARY   = "#1565c0"
 _APP_LIGHT     = "#e3f2fd"
 _APP_MID       = "#1976d2"
-CONFIG_PATH = os.path.join(SCRIPT_DIR, "config.json")
-LOG_PATH = os.path.join(SCRIPT_DIR, "scandocs_tool.log")
-DEFAULT_REPORTS_FOLDER = os.path.join(SCRIPT_DIR, "Reports")
+
+# ── User-writable data directory ───────────────────────────────────────────
+# When installed to Program Files the app folder is read-only, so config,
+# logs, and reports are stored in %APPDATA%\SpeedyScandocs instead.
+if getattr(sys, "frozen", False):
+    _appdata = os.environ.get("APPDATA", os.path.expanduser("~"))
+    _USER_DATA_DIR = os.path.join(_appdata, "SpeedyScandocs")
+    os.makedirs(_USER_DATA_DIR, exist_ok=True)
+    # Copy default client list on first run so the user can edit it
+    _bundled_cl = os.path.join(SCRIPT_DIR, "client_list.txt")
+    _user_cl    = os.path.join(_USER_DATA_DIR, "client_list.txt")
+    if not os.path.exists(_user_cl) and os.path.exists(_bundled_cl):
+        import shutil as _shutil
+        _shutil.copy2(_bundled_cl, _user_cl)
+else:
+    _USER_DATA_DIR = SCRIPT_DIR
+
+CONFIG_PATH            = os.path.join(_USER_DATA_DIR, "config.json")
+LOG_PATH               = os.path.join(_USER_DATA_DIR, "scandocs_tool.log")
+DEFAULT_REPORTS_FOLDER = os.path.join(_USER_DATA_DIR, "Reports")
 
 
 def _open_file(path: str):
     """Open a file with the default system viewer — cross-platform."""
     if sys.platform == "win32":
-        _open_file(path)
+        os.startfile(path)
     elif sys.platform == "darwin":
         subprocess.run(["open", path])
     else:
@@ -88,14 +105,19 @@ def _open_file(path: str):
 
 
 # ── PyInstaller bundle: point pytesseract at the bundled Tesseract binary ──
-# When running as a packaged app, sys._MEIPASS is set to the bundle directory.
 _bundle_dir = getattr(sys, "_MEIPASS", None)
 if _bundle_dir:
     try:
         import pytesseract as _pt
-        _bundled_tess = os.path.join(_bundle_dir, "tesseract")
-        if os.path.isfile(_bundled_tess):
-            _pt.pytesseract.tesseract_cmd = _bundled_tess
+        # Windows bundle: Tesseract-OCR/tesseract.exe
+        _bundled_tess_win = os.path.join(_bundle_dir, "Tesseract-OCR", "tesseract.exe")
+        # Mac bundle: tesseract (no extension)
+        _bundled_tess_mac = os.path.join(_bundle_dir, "tesseract")
+        if os.path.isfile(_bundled_tess_win):
+            _pt.pytesseract.tesseract_cmd = _bundled_tess_win
+            os.environ["TESSDATA_PREFIX"] = os.path.join(_bundle_dir, "Tesseract-OCR", "tessdata")
+        elif os.path.isfile(_bundled_tess_mac):
+            _pt.pytesseract.tesseract_cmd = _bundled_tess_mac
             os.environ["TESSDATA_PREFIX"] = os.path.join(_bundle_dir, "tessdata")
     except ImportError:
         pass
@@ -104,7 +126,6 @@ else:
     _TESS_CANDIDATES = [
         r"C:\Program Files\Tesseract-OCR\tesseract.exe",
         r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe",
-        r"C:\Users\treyj\AppData\Local\Programs\Tesseract-OCR\tesseract.exe",
         "/opt/homebrew/bin/tesseract",   # Mac Apple Silicon (Homebrew)
         "/usr/local/bin/tesseract",      # Mac Intel (Homebrew)
     ]
@@ -120,7 +141,7 @@ else:
 DEFAULT_CONFIG: dict = {
     "paths": {
         "scandocs_folder": "",
-        "client_list_file": os.path.join(SCRIPT_DIR, "client_list.txt"),
+        "client_list_file": os.path.join(_USER_DATA_DIR, "client_list.txt"),
     },
     "api": {
         "openwebui_url": "http://localhost:3000",
