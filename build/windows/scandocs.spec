@@ -7,8 +7,32 @@
 import os
 import glob
 
-ROOT      = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
-TESS_ROOT = r'C:\Program Files\Tesseract-OCR'
+import subprocess
+
+ROOT = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
+
+# Find Tesseract — search common locations then fall back to PATH
+_TESS_CANDIDATES = [
+    r'C:\Program Files\Tesseract-OCR',
+    r'C:\Program Files (x86)\Tesseract-OCR',
+    r'C:\tools\tesseract',
+    r'C:\ProgramData\chocolatey\lib\tesseract\tools',
+]
+TESS_ROOT = None
+for _c in _TESS_CANDIDATES:
+    if os.path.isfile(os.path.join(_c, 'tesseract.exe')):
+        TESS_ROOT = _c
+        break
+if TESS_ROOT is None:
+    try:
+        _r = subprocess.run(['where', 'tesseract'], capture_output=True, text=True)
+        if _r.returncode == 0:
+            TESS_ROOT = os.path.dirname(_r.stdout.strip().splitlines()[0])
+    except Exception:
+        pass
+if TESS_ROOT is None:
+    raise RuntimeError("Tesseract not found. Install it before building.")
+print(f"Bundling Tesseract from: {TESS_ROOT}")
 
 # Bundle Tesseract: exe + all DLLs + English language data only
 tess_datas = []
