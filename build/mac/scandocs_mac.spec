@@ -23,6 +23,26 @@ if not os.path.isfile(TESS_BINARY):
 TESS_ENG = os.path.join(TESS_ROOT, "share", "tessdata", "eng.traineddata")
 TESS_OSD = os.path.join(TESS_ROOT, "share", "tessdata", "osd.traineddata")
 
+# Generate .icns from the PNG logo if it doesn't exist yet
+ICON_PNG  = os.path.join(ROOT, 'assets', 'GDJ Logo.png')
+ICON_ICNS = os.path.join(ROOT, 'assets', 'GDJ Logo.icns')
+if not os.path.isfile(ICON_ICNS) and os.path.isfile(ICON_PNG):
+    import subprocess, tempfile, shutil
+    iconset = tempfile.mkdtemp(suffix='.iconset')
+    try:
+        from PIL import Image
+        src = Image.open(ICON_PNG).convert('RGBA')
+        for sz in [16, 32, 64, 128, 256, 512]:
+            src.resize((sz, sz), Image.LANCZOS).save(
+                os.path.join(iconset, f'icon_{sz}x{sz}.png'))
+            src.resize((sz*2, sz*2), Image.LANCZOS).save(
+                os.path.join(iconset, f'icon_{sz}x{sz}@2x.png'))
+        subprocess.run(['iconutil', '-c', 'icns', iconset, '-o', ICON_ICNS], check=True)
+    except Exception as e:
+        print(f"Warning: could not generate .icns: {e}")
+    finally:
+        shutil.rmtree(iconset, ignore_errors=True)
+
 a = Analysis(
     [os.path.join(ROOT, 'scandocs_tool.py')],
     pathex=[ROOT],
@@ -84,11 +104,13 @@ coll = COLLECT(
 app = BUNDLE(
     coll,
     name='SpeedyScandocs.app',
+    icon=ICON_ICNS if os.path.isfile(ICON_ICNS) else None,
     bundle_identifier='com.gdj.speedyscandocs',
     version='1.0',
     info_plist={
         'CFBundleDisplayName': 'Speedy Scandocs',
         'CFBundleShortVersionString': '1.0',
+        'CFBundleIconFile': 'GDJ Logo.icns',
         'NSHighResolutionCapable': True,
         'LSMinimumSystemVersion': '11.0',
     },

@@ -9,11 +9,15 @@ __pycache__/
 # User-specific config (contains hardcoded local paths)
 config.json
 
+# Sample/working documents (may contain real client data)
+sample_docs/
+
 # Generated reports (may contain client data)
 Reports/
 
 # PyInstaller build output
 dist/
+build/scandocs/
 build/windows/Output/
 
 # Build virtual environment

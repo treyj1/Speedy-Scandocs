@@ -748,8 +748,10 @@ class APIClient:
             "- Return the client's full name exactly as it appears in the document.\n"
             "- If you cannot clearly identify the client, return NEEDS_REVIEW.\n\n"
             "DESCRIPTION:\n"
-            "- 2-5 words, title case, no special characters "
+            "- 2-5 separate words with spaces between them, title case, no special characters "
             "(e.g. \"Retainer Agreement\", \"Motion to Dismiss\", \"Invoice\").\n"
+            "- IMPORTANT: Always use spaces between words. Never combine words "
+            "(e.g. write \"Medical Record Request\" NOT \"Medicalrecordrequest\").\n"
             "- NEVER describe a fax cover sheet or fax wrapper — describe the actual "
             "document content. If no real content is visible, use \"Incoming Document\".\n\n"
             "Return ONLY valid JSON with no extra text:\n"
@@ -1030,6 +1032,12 @@ class FileProcessor:
     def _safe_subject(text: str) -> str:
         text = ILLEGAL_CHARS_RE.sub("", text)
         text = re.sub(r"\s+", " ", text).strip()
+        # Split run-on words: insert space before uppercase letters that follow
+        # a lowercase letter (e.g. "RetainerAgreement" → "Retainer Agreement")
+        # or before an uppercase letter followed by a lowercase when preceded by
+        # another uppercase (e.g. "PDFDocument" → "PDF Document").
+        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+        text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
         return text.title()
 
     @staticmethod
@@ -1368,7 +1376,7 @@ class ScandocsApp(ttk.Window):
         self.after(200, self._check_first_run)
         # Show splash screen (deiconify main window when it closes)
         SplashScreen(self, on_done=self.deiconify, primary_color=_APP_PRIMARY,
-                     show_duration_ms=7500)
+                     show_duration_ms=3000)
 
     # ── UI Construction ───────────────────────────────────────
 
@@ -1377,7 +1385,7 @@ class ScandocsApp(ttk.Window):
         png_path = os.path.join(ASSETS_DIR, "GDJ Logo.png")
         ico_path = os.path.join(ASSETS_DIR, "GDJ Logo.ico")
 
-        # Generate the .ico from PNG if it doesn't exist yet
+        # Generate the .ico from PNG if it doesn't exist yet (Windows)
         if not os.path.isfile(ico_path) and PILImage is not None and os.path.isfile(png_path):
             try:
                 src = PILImage.open(png_path).convert("RGBA")
@@ -1389,15 +1397,22 @@ class ScandocsApp(ttk.Window):
             except Exception as e:
                 logging.warning(f"Could not create icon file: {e}")
 
-        # Title bar icon (standard tkinter)
-        if os.path.isfile(ico_path):
-            try:
-                self.iconbitmap(ico_path)
-            except Exception as e:
-                logging.warning(f"iconbitmap failed: {e}")
-
-        # Note: taskbar icon cannot be changed while running as python.exe.
-        # It will display correctly once packaged as an .exe with PyInstaller.
+        if sys.platform == "darwin":
+            # macOS: use iconphoto with a PNG — iconbitmap(.ico) does not work
+            if PILImage is not None and os.path.isfile(png_path):
+                try:
+                    img = PILImage.open(png_path).convert("RGBA")
+                    self._app_icon_photo = PILImageTk.PhotoImage(img)
+                    self.iconphoto(True, self._app_icon_photo)
+                except Exception as e:
+                    logging.warning(f"iconphoto (macOS) failed: {e}")
+        else:
+            # Windows/Linux: use iconbitmap with .ico
+            if os.path.isfile(ico_path):
+                try:
+                    self.iconbitmap(ico_path)
+                except Exception as e:
+                    logging.warning(f"iconbitmap failed: {e}")
 
     def _build_ui(self):
         self._build_header()
@@ -1502,7 +1517,7 @@ class ScandocsApp(ttk.Window):
         )
 
         # Results table
-        cols = ("audited", "original", "new_name", "status", "client", "confidence",
+        cols = ("audited", "original", "new_name", "status", "client",
                 "new_location")
         col_cfg = {
             "audited":      ("✓",              32),
@@ -1510,7 +1525,6 @@ class ScandocsApp(ttk.Window):
             "new_name":     ("New Name",        240),
             "status":       ("Status",           75),
             "client":       ("Client",          170),
-            "confidence":   ("Confidence",       75),
             "new_location": ("New Location",    130),
         }
         tree_frame = ttk.Frame(tab)
@@ -1549,7 +1563,7 @@ class ScandocsApp(ttk.Window):
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self.results_tree.pack(fill=tk.BOTH, expand=True)
         self.results_tree.bind("<<TreeviewSelect>>", self._on_result_select)
-        self.results_tree.bind("<Return>",          self._on_tree_return)
+        self.results_tree.bind("<space>",           self._on_tree_return)
         self.results_tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self.results_tree.bind("<Left>",   self._audit_prev)
         self.results_tree.bind("<Right>",  self._audit_next)
@@ -1713,7 +1727,7 @@ class ScandocsApp(ttk.Window):
         rv_sb.pack(side=tk.RIGHT, fill=tk.Y)
         self.review_listbox.pack(fill=tk.BOTH, expand=True, padx=4, pady=4)
         self.review_listbox.bind("<<ListboxSelect>>", self._on_review_select)
-        self.review_listbox.bind("<Return>",          self._on_review_return)
+        self.review_listbox.bind("<space>",           self._on_review_return)
         self.review_listbox.bind("<Double-Button-1>", self._on_review_double_click)
         self.review_listbox.bind("<Left>",   self._review_prev)
         self.review_listbox.bind("<Right>",  self._review_next)
@@ -2686,10 +2700,11 @@ class ScandocsApp(ttk.Window):
         return rows
 
     @staticmethod
-    def _save_xlsx(path: str, headers: list, rows: list):
+    def _save_xlsx(path: str, headers: list, rows: list, results: list = None):
         """Write an Excel workbook with auto-fitted columns and a styled header row.
         Rows where 'Audit: Wrong Client' is 'Yes' are highlighted in red — these
-        are the most critical errors and must be easy to spot."""
+        are the most critical errors and must be easy to spot.
+        If `results` is provided, a Summary sheet is added."""
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Results"
@@ -2737,6 +2752,77 @@ class ScandocsApp(ttk.Window):
             ws.column_dimensions[letter].width = min(max(max_len + 2, 12), 60)
 
         ws.freeze_panes = "A2"  # keep header visible while scrolling
+
+        # ── Summary sheet ─────────────────────────────────────
+        if results is not None:
+            ss = wb.create_sheet("Summary", 0)  # insert as first tab
+
+            total       = len(results)
+            skipped     = sum(1 for r in results if r.status == "skipped")
+            errors      = sum(1 for r in results if r.status == "error")
+            identified  = sum(1 for r in results if r.status == "renamed")
+            needs_rev   = sum(1 for r in results if r.status == "needs_review")
+            processed   = total - skipped - errors  # docs that went through AI
+
+            # Audit counts (only processed files can be audited)
+            _was_audited = lambda r: (r.audit_correct or r.audit_wrong_client
+                                      or r.audit_bad_description or r.audit_failed_client
+                                      or r.audit_should_review)
+            audited       = sum(1 for r in results if _was_audited(r))
+            audit_correct = sum(1 for r in results if r.audit_correct)
+            audit_wrong   = sum(1 for r in results if r.audit_wrong_client)
+            audit_bad_desc = sum(1 for r in results if r.audit_bad_description)
+            audit_failed  = sum(1 for r in results if r.audit_failed_client)
+            audit_should  = sum(1 for r in results if r.audit_should_review)
+
+            # Identified-client subset audit
+            id_results    = [r for r in results if r.status == "renamed"]
+            id_audited    = sum(1 for r in id_results if _was_audited(r))
+            id_correct    = sum(1 for r in id_results if r.audit_correct)
+
+            def _pct(num, denom):
+                return f"{num / denom * 100:.1f}%" if denom else "N/A"
+
+            summary_data = [
+                ("Documents Total",                     total),
+                ("Documents Processed",                 processed),
+                ("Documents Skipped",                   skipped),
+                ("Documents With Errors",               errors),
+                ("Documents Identified a Client",       identified),
+                ("Documents Marked Needs Review",       needs_rev),
+                ("", ""),
+                ("Audit Completion (All Processed)",    _pct(audited, processed)),
+                ("Audit Completion (Identified Only)",  _pct(id_audited, identified)),
+                ("", ""),
+                ("Success Rate (All Audited)",          _pct(audit_correct, audited)),
+                ("Success Rate (Identified Only)",      _pct(id_correct, id_audited)),
+                ("", ""),
+                ("Audit Flags",                         ""),
+                ("  Marked Correct",                    audit_correct),
+                ("  Wrong Client",                      audit_wrong),
+                ("  Bad Description",                   audit_bad_desc),
+                ("  Failed to Identify Client",         audit_failed),
+                ("  Should Have Been Flagged",          audit_should),
+            ]
+
+            # Style the summary sheet
+            title_font = Font(bold=True, size=14, color="1F497D")
+            label_font = Font(bold=True, size=11)
+            value_font = Font(size=11)
+            ss.append(["Audit Summary"])
+            ss["A1"].font = title_font
+            ss.append([])  # blank row
+
+            for label, value in summary_data:
+                ss.append([label, value])
+            for row_cells in ss.iter_rows(min_row=3, max_row=ss.max_row, max_col=2):
+                row_cells[0].font = label_font
+                row_cells[1].font = value_font
+                row_cells[1].alignment = Alignment(horizontal="right")
+
+            ss.column_dimensions["A"].width = 42
+            ss.column_dimensions["B"].width = 18
+
         wb.save(path)
 
     @staticmethod
@@ -2755,7 +2841,7 @@ class ScandocsApp(ttk.Window):
         rows = self._results_as_rows()
         if _XLSX_AVAILABLE:
             path = os.path.join(folder, f"scandocs_report_{ts}.xlsx")
-            self._save_xlsx(path, headers, rows)
+            self._save_xlsx(path, headers, rows, results=self._results)
         else:
             path = os.path.join(folder, f"scandocs_report_{ts}.csv")
             self._save_csv(path, headers, rows)
@@ -2780,7 +2866,6 @@ class ScandocsApp(ttk.Window):
                 result.final_name,
                 label,
                 client_cell,
-                result.confidence,
                 "",   # new_location — filled in by _fo_do_move
             ),
             tags=(tag,),
@@ -2979,9 +3064,9 @@ class ScandocsApp(ttk.Window):
             import shutil
             shutil.move(src, dst)
             result.moved_to = dst
-            # Update the New Location column (index 6) in the treeview row
+            # Update the New Location column (index 5) in the treeview row
             vals = list(self.results_tree.item(iid, "values"))
-            vals[6] = os.path.basename(dest)
+            vals[5] = os.path.basename(dest)
             self.results_tree.item(iid, values=vals, tags=("moved",))
             return True
         except Exception as e:
@@ -3012,7 +3097,7 @@ class ScandocsApp(ttk.Window):
                     continue
                 result.pending_dest = dest
                 vals = list(self.results_tree.item(iid, "values"))
-                vals[6] = f"{folder_label} (pending)"
+                vals[5] = f"{folder_label} (pending)"
                 self.results_tree.item(iid, values=vals)
                 count += 1
         if count:
@@ -3168,11 +3253,11 @@ class ScandocsApp(ttk.Window):
         # ✓ column in treeview
         if on:
             self.results_tree["displaycolumns"] = (
-                "audited", "original", "new_name", "status", "client", "confidence",
+                "audited", "original", "new_name", "status", "client",
                 "new_location")
         else:
             self.results_tree["displaycolumns"] = (
-                "original", "new_name", "status", "client", "confidence",
+                "original", "new_name", "status", "client",
                 "new_location")
         # Audit panel
         if on:
@@ -3262,12 +3347,12 @@ class ScandocsApp(ttk.Window):
         """Sort the results treeview by *col*, toggling A→Z / Z→A on repeated clicks."""
         col_index = {
             "audited": 0, "original": 1, "new_name": 2,
-            "status": 3, "client": 4, "confidence": 5, "new_location": 6,
+            "status": 3, "client": 4, "new_location": 5,
         }
         col_labels = {
             "audited": "✓", "original": "Original File", "new_name": "New Name",
             "status": "Status", "client": "Client",
-            "confidence": "Confidence", "new_location": "New Location",
+            "new_location": "New Location",
         }
         sortable = {"original", "new_name", "status", "client"}
 
@@ -3691,7 +3776,7 @@ class ScandocsApp(ttk.Window):
             self._open_file_popup(path)
 
     def _on_tree_return(self, _event=None):
-        """Enter key on the Auto-Process results tree: toggle the file viewer."""
+        """Spacebar on the Auto-Process results tree: toggle the file viewer."""
         sel = self.results_tree.selection()
         if not sel:
             return "break"
@@ -3707,7 +3792,7 @@ class ScandocsApp(ttk.Window):
         return "break"   # prevent treeview default Enter behaviour
 
     def _on_review_return(self, _event=None):
-        """Enter key on the Manual Entry list: toggle the file viewer."""
+        """Spacebar on the Manual Entry list: toggle the file viewer."""
         sel = self.review_listbox.curselection()
         filename = (self.review_listbox.get(sel[0]) if sel
                     else self._review_selected_file)
@@ -3797,18 +3882,49 @@ class ScandocsApp(ttk.Window):
                 except Exception as e:
                     errors.append(f"{current_name}: {e}")
 
-        # Save report
-        folder = self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
+        # Build audit folder: ScandocsAudit_YYYY-MM-DD_NN
+        import shutil
+        report_root = self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
+        os.makedirs(report_root, exist_ok=True)
+        today_str = datetime.datetime.now().strftime("%Y-%m-%d")
+        audit_num = 1
+        while True:
+            audit_folder_name = f"ScandocsAudit_{today_str}_{audit_num:02d}"
+            audit_folder = os.path.join(report_root, audit_folder_name)
+            if not os.path.exists(audit_folder):
+                break
+            audit_num += 1
+        os.makedirs(audit_folder)
+
+        # Save report into the audit folder
         try:
-            path = self._write_report(folder)
+            path = self._write_report(audit_folder)
         except Exception as e:
             messagebox.showerror("Report Error", f"Could not save report:\n{e}")
             return
 
+        # Copy files marked as Wrong Client into the audit folder
+        wrong_client_copies = []
+        for result in self._results:
+            if not result.audit_wrong_client:
+                continue
+            src_path = os.path.join(scandocs, result.final_name)
+            if not os.path.isfile(src_path):
+                src_path = os.path.join(scandocs, result.original_name)
+            if os.path.isfile(src_path):
+                try:
+                    dest = os.path.join(audit_folder, os.path.basename(src_path))
+                    shutil.copy2(src_path, dest)
+                    wrong_client_copies.append(os.path.basename(src_path))
+                except Exception as e:
+                    errors.append(f"Copy {os.path.basename(src_path)}: {e}")
+
         # Grey out the button so it can't be submitted twice
         self.btn_submit_audit.config(state=tk.DISABLED, text="Audit Submitted ✓")
 
-        msg = f"Audit submitted.\nReport saved to:\n{os.path.basename(path)}"
+        msg = f"Audit submitted.\nReport saved to:\n{audit_folder_name}/"
+        if wrong_client_copies:
+            msg += f"\n\n{len(wrong_client_copies)} Wrong Client file(s) copied to audit folder."
         if errors:
             msg += f"\n\nWarnings ({len(errors)}):\n" + "\n".join(errors[:5])
         messagebox.showinfo("Audit Submitted", msg)
