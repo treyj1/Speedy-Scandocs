@@ -71,7 +71,7 @@ ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 # APP_VERSION is bumped by build/release.py — keep it in sync with the
 # installer.iss AppVersion. Auto-update checks GitHub Releases on UPDATE_REPO
 # and compares the latest tag (vX.Y.Z) against APP_VERSION.
-APP_VERSION = "1.8.1"
+APP_VERSION = "1.8.2"
 UPDATE_REPO = "treyj1/Speedy-Scandocs"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60   # 24 hours
@@ -148,6 +148,20 @@ else:
                 _pt.pytesseract.tesseract_cmd = _p
                 break
     except ImportError:
+        pass
+
+
+# ── Windows taskbar identity ───────────────────────────────────────────────
+# Without an explicit AppUserModelID, Windows groups the running app under
+# Python's default ID and the taskbar icon falls back to Python's, not the
+# embedded EXE icon. Must be set before any Tk window is mapped.
+if sys.platform == "win32":
+    try:
+        import ctypes as _ctypes
+        _ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(
+            "com.gdj.speedyscandocs"
+        )
+    except Exception:
         pass
 
 
@@ -4718,22 +4732,24 @@ class ScandocsApp(ttk.Window):
 
     def _do_update_check(self, silent: bool):
         release = fetch_latest_release()
-        # Always stamp the last_check even if the network failed — prevents
-        # us from hammering GitHub in a loop if the user is offline.
-        self.config_mgr.config["updates"]["last_check_iso"] = \
-            datetime.datetime.now().isoformat(timespec="seconds")
-        try:
-            self.config_mgr.save()
-        except Exception:
-            pass
-
         if not release:
+            # Don't stamp last_check_iso on failure — otherwise a one-time
+            # network blip (or a previously private repo returning 404) locks
+            # auto-update out for 24h. The check only runs once per launch,
+            # so retry-on-next-launch is fine.
             if not silent:
                 self.after(0, lambda: messagebox.showwarning(
                     "Check for Updates",
                     "Couldn't reach the update server.\n"
                     "Check your internet connection and try again."))
             return
+
+        self.config_mgr.config["updates"]["last_check_iso"] = \
+            datetime.datetime.now().isoformat(timespec="seconds")
+        try:
+            self.config_mgr.save()
+        except Exception:
+            pass
 
         tag = release.get("tag_name") or ""
         latest = _parse_version(tag)

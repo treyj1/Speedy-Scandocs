@@ -9,7 +9,7 @@
 ;     File should be named: tesseract-ocr-w64-setup.exe
 
 #define AppName      "Speedy Scandocs"
-#define AppVersion   "1.8.1"
+#define AppVersion   "1.8.2"
 #define AppPublisher "GDJ"
 #define AppExeName   "SpeedyScandocs.exe"
 #define DistDir      "..\..\dist\SpeedyScandocs"

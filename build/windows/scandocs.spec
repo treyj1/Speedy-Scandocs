@@ -83,7 +83,7 @@ exe = EXE(
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
-    upx=True,
+    upx=False,                              # UPX strips the embedded icon
     console=False,                          # no console window
     icon=os.path.join(ROOT, 'assets', 'GDJ Logo.ico'),
 )
@@ -93,7 +93,7 @@ coll = COLLECT(
     a.binaries,
     a.datas,
     strip=False,
-    upx=True,
+    upx=False,
     upx_exclude=[],
     name='SpeedyScandocs',                  # output folder name in dist/
 )
