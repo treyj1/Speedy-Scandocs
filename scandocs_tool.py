@@ -30,8 +30,8 @@ try:
     _XLSX_AVAILABLE = True
 except ImportError:
     _XLSX_AVAILABLE = False
-from dataclasses import dataclass
-from typing import Optional
+from dataclasses import dataclass, field
+from typing import Optional, List
 
 import tkinter as tk
 from tkinter import messagebox, filedialog
@@ -67,11 +67,24 @@ except ImportError:
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 
+# ── Version + auto-update ──────────────────────────────────────────────────
+# APP_VERSION is bumped by build/release.py — keep it in sync with the
+# installer.iss AppVersion. Auto-update checks GitHub Releases on UPDATE_REPO
+# and compares the latest tag (vX.Y.Z) against APP_VERSION.
+APP_VERSION = "1.7.0"
+UPDATE_REPO = "treyj1/Speedy-Scandocs"
+UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
+UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60   # 24 hours
+
 # ── Colour-palette definitions ─────────────────────────────────────────────
 # App primary color — fixed, no user-selectable palette
 _APP_PRIMARY   = "#1565c0"
 _APP_LIGHT     = "#e3f2fd"
 _APP_MID       = "#1976d2"
+
+# ── Typography ─────────────────────────────────────────────────────────────
+# Single app-wide font family.
+APP_FONT = "Times New Roman"
 
 # ── User-writable data directory ───────────────────────────────────────────
 # When installed to Program Files / Applications the app bundle is read-only,
@@ -143,6 +156,60 @@ else:
     except ImportError:
         pass
 
+
+# ── Bundled font registration ──────────────────────────────────────────────
+# Must run before any Tk window is created — GDI/CoreText caches font lists
+# at Tk init time, so a late registration won't be visible to tkinter.
+def _load_bundled_fonts() -> None:
+    fonts_dir = os.path.join(ASSETS_DIR, "fonts")
+    if not os.path.isdir(fonts_dir):
+        return
+    ttfs = [os.path.join(fonts_dir, f) for f in os.listdir(fonts_dir)
+            if f.lower().endswith(".ttf")]
+    if not ttfs:
+        return
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            FR_PRIVATE = 0x10
+            gdi32 = ctypes.WinDLL("gdi32")
+            gdi32.AddFontResourceExW.argtypes = [
+                ctypes.c_wchar_p, ctypes.c_ulong, ctypes.c_void_p]
+            gdi32.AddFontResourceExW.restype = ctypes.c_int
+            for path in ttfs:
+                if gdi32.AddFontResourceExW(path, FR_PRIVATE, 0) == 0:
+                    logging.info(f"AddFontResourceExW failed: {path}")
+        except Exception as e:
+            logging.info(f"Windows font load failed: {e}")
+    elif sys.platform == "darwin":
+        try:
+            import ctypes
+            from ctypes import c_void_p, c_bool, c_long, c_uint32, c_char_p
+            cf = ctypes.CDLL("/System/Library/Frameworks/CoreFoundation.framework/CoreFoundation")
+            ct = ctypes.CDLL("/System/Library/Frameworks/CoreText.framework/CoreText")
+            cf.CFStringCreateWithCString.restype = c_void_p
+            cf.CFStringCreateWithCString.argtypes = [c_void_p, c_char_p, c_uint32]
+            cf.CFURLCreateWithFileSystemPath.restype = c_void_p
+            cf.CFURLCreateWithFileSystemPath.argtypes = [c_void_p, c_void_p, c_long, c_bool]
+            cf.CFRelease.argtypes = [c_void_p]
+            ct.CTFontManagerRegisterFontsForURL.restype = c_bool
+            ct.CTFontManagerRegisterFontsForURL.argtypes = [c_void_p, c_uint32, c_void_p]
+            kCFStringEncodingUTF8 = 0x08000100
+            kCTFontManagerScopeProcess = 1
+            for path in ttfs:
+                cfstr = cf.CFStringCreateWithCString(
+                    None, path.encode("utf-8"), kCFStringEncodingUTF8)
+                if not cfstr:
+                    continue
+                cfurl = cf.CFURLCreateWithFileSystemPath(None, cfstr, 0, False)
+                if cfurl:
+                    ct.CTFontManagerRegisterFontsForURL(
+                        cfurl, kCTFontManagerScopeProcess, None)
+                    cf.CFRelease(cfurl)
+                cf.CFRelease(cfstr)
+        except Exception as e:
+            logging.info(f"macOS font load failed: {e}")
+
 DEFAULT_CONFIG: dict = {
     "paths": {
         "scandocs_folder": "",
@@ -169,15 +236,46 @@ DEFAULT_CONFIG: dict = {
         "suggest_location_parent_folder": "",
         "auto_commit_moves": False,
         "candidate_list_size": 10,
+        "extraction_method": "ocr",   # "ocr" or "vision"
+        "max_vision_pages": 2,          # pages sent to vision model per doc
+        "ocr_preprocess": True,         # upscale/binarize/autocontrast before OCR
     },
     "reports": {
         "auto_save": True,
         "report_folder": DEFAULT_REPORTS_FOLDER,
     },
+    "updates": {
+        "check_on_startup": True,
+        "last_check_iso": "",
+        "skip_version": "",
+    },
 }
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg"}
 ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+# ── Vision model allowlist ───────────────────────────────────────────
+# Substring-matched against the lowercased Ollama model name. Any model
+# whose tag contains one of these prefixes is treated as vision-capable,
+# which unlocks "Use Vision Model" in Settings. Excluded tags (cloud
+# variants) send document images off-device, which isn't acceptable for
+# law office client documents, so we force those to OCR mode.
+VISION_MODEL_PREFIXES = [
+    "llama3.2-vision",  # 11b and 90b
+    "gemma4",           # latest, e2b, e4b, 26b, 31b (local variants)
+]
+VISION_MODEL_EXCLUSIONS = ["-cloud", ":cloud"]
+
+
+def model_supports_vision(model_name: str) -> bool:
+    """Return True if the given Ollama model tag is a local vision model
+    in our allowlist. Cloud variants are intentionally excluded."""
+    if not model_name:
+        return False
+    name = model_name.lower()
+    if any(excl in name for excl in VISION_MODEL_EXCLUSIONS):
+        return False
+    return any(prefix in name for prefix in VISION_MODEL_PREFIXES)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -187,9 +285,13 @@ ILLEGAL_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
 @dataclass
 class ExtractionResult:
     content_type: str   # "text" or "image"
-    content: str        # text string or base64 string
+    content: str        # text string or first base64 image (back-compat)
     mime_type: str = "image/png"
     method: str = ""    # "pymupdf", "tesseract", or "vision"
+    # For multi-page vision extraction. When non-empty, APIClient sends
+    # every base64 image in this list to the model. `content` mirrors
+    # images[0] for back-compat with single-image code paths.
+    images: List[str] = field(default_factory=list)
 
 
 @dataclass
@@ -235,6 +337,7 @@ class ConfigManager:
             merged["api"].update(data.get("api", {}))
             merged["processing"].update(data.get("processing", {}))
             merged["reports"].update(data.get("reports", {}))
+            merged["updates"].update(data.get("updates", {}))
             return merged
         except Exception as e:
             logging.warning(f"Could not load config.json: {e}. Using defaults.")
@@ -540,14 +643,46 @@ class DocumentExtractor:
     IMAGE_RENDER_SCALE = 300 / 72  # ~4.17x — renders at 300 DPI for better OCR accuracy
 
     @staticmethod
-    def extract(file_path: str, max_chars: int = 4000, max_pages: int = 5) -> ExtractionResult:
+    def extract(file_path: str, max_chars: int = 4000, max_pages: int = 5,
+                vision_mode: bool = False, max_vision_pages: int = 2,
+                ocr_preprocess: bool = True) -> ExtractionResult:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
-            return DocumentExtractor._from_pdf(file_path, max_chars, max_pages)
+            if vision_mode:
+                return DocumentExtractor._from_pdf_vision(file_path, max_vision_pages)
+            return DocumentExtractor._from_pdf(file_path, max_chars, max_pages,
+                                                ocr_preprocess=ocr_preprocess)
         elif ext in (".jpg", ".jpeg"):
             return DocumentExtractor._from_jpeg(file_path)
         else:
             raise ValueError(f"Unsupported file type: {ext}")
+
+    @staticmethod
+    def _from_pdf_vision(file_path: str, max_vision_pages: int) -> ExtractionResult:
+        """Render the first N pages of a PDF as PNG images and return them
+        as a base64 image list for the vision model. Bypasses OCR entirely."""
+        if fitz is None:
+            raise ImportError("PyMuPDF is not installed. Run: pip install PyMuPDF")
+        doc = fitz.open(file_path)
+        page_limit = min(doc.page_count, max(1, max_vision_pages))
+        scale = DocumentExtractor.IMAGE_RENDER_SCALE
+        mat = fitz.Matrix(scale, scale)
+        images_b64: List[str] = []
+        for i in range(page_limit):
+            pix = doc[i].get_pixmap(matrix=mat)
+            images_b64.append(base64.b64encode(pix.tobytes("png")).decode("utf-8"))
+        doc.close()
+        logging.info(
+            f"{os.path.basename(file_path)}: vision mode — sending "
+            f"{len(images_b64)} page(s) to model"
+        )
+        return ExtractionResult(
+            content_type="image",
+            content=images_b64[0] if images_b64 else "",
+            mime_type="image/png",
+            method="vision",
+            images=images_b64,
+        )
 
     # Labels that reliably identify the client when they appear in document text
     _CLIENT_LABEL_RE = re.compile(
@@ -583,7 +718,8 @@ class DocumentExtractor:
         return snippets
 
     @staticmethod
-    def _from_pdf(file_path: str, max_chars: int, max_pages: int = 5) -> ExtractionResult:
+    def _from_pdf(file_path: str, max_chars: int, max_pages: int = 5,
+                  ocr_preprocess: bool = True) -> ExtractionResult:
         if fitz is None:
             raise ImportError("PyMuPDF is not installed. Run: pip install PyMuPDF")
         doc = fitz.open(file_path)
@@ -641,7 +777,8 @@ class DocumentExtractor:
         ocr_unlabeled = []
         for i in range(page_limit):
             ocr_text = DocumentExtractor._ocr_pdf_page(file_path, page_index=i,
-                                                        max_chars=max_chars)
+                                                        max_chars=max_chars,
+                                                        preprocess=ocr_preprocess)
             if not ocr_text:
                 continue
             snippets = DocumentExtractor._extract_labeled_snippets(ocr_text)
@@ -667,7 +804,8 @@ class DocumentExtractor:
         return DocumentExtractor._render_pdf_page(file_path)
 
     @staticmethod
-    def _ocr_pdf_page(file_path: str, page_index: int, max_chars: int) -> str:
+    def _ocr_pdf_page(file_path: str, page_index: int, max_chars: int,
+                      preprocess: bool = True) -> str:
         """Run Tesseract OCR on a single PDF page rendered to an image.
         Returns extracted text if >= 50 characters were found, otherwise empty string.
         Returns empty string silently on any error so the caller can fall back gracefully."""
@@ -683,11 +821,57 @@ class DocumentExtractor:
             doc.close()
             import io
             pil = PILImage.open(io.BytesIO(pix.tobytes("png")))
+            if preprocess:
+                pil = DocumentExtractor._preprocess_for_ocr(pil)
             text = pytesseract.image_to_string(pil).strip()
             return text[:max_chars] if len(text) >= 50 else ""
         except Exception as e:
             logging.warning(f"OCR failed on {file_path} page {page_index}: {e}")
             return ""
+
+    @staticmethod
+    def _preprocess_for_ocr(img):
+        """Upscale, contrast-normalize, and binarize a page image so Tesseract
+        has the cleanest possible input. Falls back to the original image on
+        any error — preprocessing must never break OCR."""
+        try:
+            from PIL import ImageOps
+            g = img.convert("L")
+            w, h = g.size
+            # Tesseract is trained on ~300 DPI text; upscale small scans.
+            target = 2000
+            if max(w, h) < target:
+                scale = target / max(w, h)
+                g = g.resize((int(w * scale), int(h * scale)), PILImage.LANCZOS)
+            g = ImageOps.autocontrast(g, cutoff=2)
+            # Otsu threshold — picks the split that best separates ink from paper.
+            hist = g.histogram()[:256]
+            total = sum(hist)
+            if total == 0:
+                return g
+            sum_total = sum(i * hist[i] for i in range(256))
+            sum_b = 0.0
+            w_b = 0
+            var_max = 0.0
+            threshold = 127
+            for t in range(256):
+                w_b += hist[t]
+                if w_b == 0:
+                    continue
+                w_f = total - w_b
+                if w_f == 0:
+                    break
+                sum_b += t * hist[t]
+                m_b = sum_b / w_b
+                m_f = (sum_total - sum_b) / w_f
+                var_between = w_b * w_f * (m_b - m_f) ** 2
+                if var_between > var_max:
+                    var_max = var_between
+                    threshold = t
+            return g.point(lambda p: 255 if p > threshold else 0, mode="1")
+        except Exception as e:
+            logging.warning(f"OCR preprocessing failed, using raw image: {e}")
+            return img
 
     @staticmethod
     def _render_pdf_page(file_path: str) -> ExtractionResult:
@@ -796,16 +980,19 @@ class APIClient:
             headers["Authorization"] = f"Bearer {api_cfg['api_key']}"
 
         if extraction.content_type == "image":
-            # OpenAI vision format: content is an array
+            # OpenAI vision format: content is an array. Send every page
+            # the extractor produced (vision mode may return multiple).
+            image_list = extraction.images or [extraction.content]
             content_parts = [
-                {"type": "text", "text": prompt.replace("[See attached image]", "").strip()},
-                {
+                {"type": "text", "text": prompt.replace("[See attached image]", "").strip()}
+            ]
+            for b64 in image_list:
+                content_parts.append({
                     "type": "image_url",
                     "image_url": {
-                        "url": f"data:{extraction.mime_type};base64,{extraction.content}"
+                        "url": f"data:{extraction.mime_type};base64,{b64}"
                     },
-                },
-            ]
+                })
             messages = [{"role": "user", "content": content_parts}]
         else:
             messages = [{"role": "user", "content": prompt}]
@@ -832,7 +1019,7 @@ class APIClient:
             "stream": False,
         }
         if extraction.content_type == "image":
-            payload["images"] = [extraction.content]
+            payload["images"] = extraction.images or [extraction.content]
 
         resp = requests.post(
             url, json=payload,
@@ -925,11 +1112,24 @@ class FileProcessor:
             if os.path.getsize(file_path) == 0:
                 raise ValueError("File is empty (0 bytes)")
 
+            # Decide extraction method. Vision mode is only honored when:
+            #   1. The user selected it in Settings, AND
+            #   2. The selected model is on the local vision allowlist.
+            # Any other case silently falls back to OCR so the pipeline
+            # never breaks if the user switches to a non-vision model.
+            use_vision = (
+                proc_cfg.get("extraction_method", "ocr") == "vision"
+                and model_supports_vision(config.get("api", {}).get("model", ""))
+            )
+
             # Extract content
             extraction = DocumentExtractor.extract(
                 file_path,
                 proc_cfg["max_ocr_chars"],
                 proc_cfg.get("max_pages", 5),
+                vision_mode=use_vision,
+                max_vision_pages=proc_cfg.get("max_vision_pages", 2),
+                ocr_preprocess=proc_cfg.get("ocr_preprocess", True),
             )
 
             # Classify via AI
@@ -1248,7 +1448,7 @@ class SplashScreen:
                      bg="#ffffff", bd=0).place(relx=0.5, y=70, anchor="center")
         else:
             tk.Label(self.win, text="Speedy Scandocs", bg="#ffffff",
-                     fg=primary, font=("Segoe UI", 20, "bold")).place(
+                     fg=primary, font=(APP_FONT, 20, "bold")).place(
                 relx=0.5, y=70, anchor="center")
 
         # Spinner canvas
@@ -1260,14 +1460,14 @@ class SplashScreen:
         self._joke_var = tk.StringVar(value="")
         self._joke_lbl = tk.Label(
             self.win, textvariable=self._joke_var, bg="#ffffff",
-            fg="#555555", font=("Segoe UI", 10, "italic"),
+            fg="#555555", font=(APP_FONT, 10, "italic"),
             wraplength=460, justify="center",
         )
         self._joke_lbl.place(relx=0.5, y=240, anchor="center", width=480)
 
         # Footer hint
         tk.Label(self.win, text="Loading, please wait…", bg="#ffffff",
-                 fg="#bbbbbb", font=("Segoe UI", 8)).place(
+                 fg="#bbbbbb", font=(APP_FONT, 8)).place(
             relx=0.5, y=320, anchor="center")
 
     # ── Spinner animation ─────────────────────────────────────
@@ -1336,6 +1536,98 @@ class SplashScreen:
 # ScandocsApp  (tkinter GUI)
 # ─────────────────────────────────────────────────────────────
 
+# ─────────────────────────────────────────────────────────────
+# Auto-update (GitHub Releases)
+# ─────────────────────────────────────────────────────────────
+
+def _parse_version(tag: str) -> tuple:
+    """'v1.8.0' or '1.8.0' -> (1, 8, 0). Unknown suffixes are dropped.
+    Returns (0,) on a tag we can't parse so we never offer a bogus update."""
+    if not tag:
+        return (0,)
+    s = tag.strip().lstrip("vV")
+    parts = []
+    for chunk in s.split("."):
+        num = ""
+        for ch in chunk:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        if not num:
+            break
+        parts.append(int(num))
+    return tuple(parts) if parts else (0,)
+
+
+def _pick_release_asset(release: dict) -> Optional[dict]:
+    """Pick the right platform asset from a GitHub release JSON payload.
+    Windows -> first .exe, Mac -> first .dmg. Returns asset dict or None."""
+    assets = release.get("assets") or []
+    if sys.platform == "win32":
+        want = ".exe"
+    elif sys.platform == "darwin":
+        want = ".dmg"
+    else:
+        return None
+    for a in assets:
+        name = (a.get("name") or "").lower()
+        if name.endswith(want):
+            return a
+    return None
+
+
+def fetch_latest_release(timeout: float = 8.0) -> Optional[dict]:
+    """Hit the GitHub API for the latest release. Returns parsed JSON or None.
+    Silent on network failure — we don't want offline users to see errors."""
+    if requests is None:
+        return None
+    try:
+        r = requests.get(
+            UPDATE_API_URL,
+            headers={"Accept": "application/vnd.github+json"},
+            timeout=timeout,
+        )
+        if r.status_code != 200:
+            logging.info(f"Update check: HTTP {r.status_code}")
+            return None
+        return r.json()
+    except Exception as e:
+        logging.info(f"Update check failed: {e}")
+        return None
+
+
+def download_file(url: str, dest_path: str,
+                  progress_cb=None, cancel_flag=None) -> bool:
+    """Stream a file to dest_path. progress_cb(downloaded, total) called
+    periodically. cancel_flag is a callable returning True to abort.
+    Returns True on success."""
+    if requests is None:
+        return False
+    try:
+        with requests.get(url, stream=True, timeout=30) as r:
+            r.raise_for_status()
+            total = int(r.headers.get("Content-Length") or 0)
+            downloaded = 0
+            tmp = dest_path + ".part"
+            with open(tmp, "wb") as f:
+                for chunk in r.iter_content(chunk_size=65536):
+                    if cancel_flag and cancel_flag():
+                        try: os.remove(tmp)
+                        except OSError: pass
+                        return False
+                    if chunk:
+                        f.write(chunk)
+                        downloaded += len(chunk)
+                        if progress_cb:
+                            progress_cb(downloaded, total)
+            os.replace(tmp, dest_path)
+            return True
+    except Exception as e:
+        logging.warning(f"Download failed: {e}")
+        return False
+
+
 class ScandocsApp(ttk.Window):
 
     def __init__(self):
@@ -1344,6 +1636,8 @@ class ScandocsApp(ttk.Window):
         self.title("Speedy Scandocs")
         self.geometry("1500x1000")
         self.minsize(1100, 800)
+
+        self._apply_app_font()
 
         self.config_mgr = ConfigManager()
         self.engine = ProcessingEngine()
@@ -1367,16 +1661,183 @@ class ScandocsApp(ttk.Window):
 
         os.makedirs(DEFAULT_REPORTS_FOLDER, exist_ok=True)
 
+        # Show splash FIRST so the user sees something immediately while the
+        # heavy UI build runs. Force a redraw so the splash paints before
+        # _build_ui blocks the main thread.
+        self._splash = SplashScreen(
+            self, on_done=self.deiconify, primary_color=_APP_PRIMARY,
+            show_duration_ms=3000,
+        )
+        self.update_idletasks()
+        self.update()
+
+        # Defer heavy initialisation to after_idle so the splash's event loop
+        # has a chance to render and animate before we block on UI build.
+        self.after_idle(self._deferred_init)
+
+    def _deferred_init(self):
+        """Run the heavy UI build after the splash has rendered."""
         self._build_ui()
+        # Must run AFTER _build_ui — ttkbootstrap builds its per-color button
+        # styles lazily the first time a button with that bootstyle is
+        # constructed, so an earlier override would be overwritten.
+        self._apply_rounded_buttons()
         self._load_settings_to_ui()
         self._refresh_client_list_tab()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Set icon after ttkbootstrap finishes its own setup to prevent it being overridden
         self.after(100, self._set_window_icon)
         self.after(200, self._check_first_run)
-        # Show splash screen (deiconify main window when it closes)
-        SplashScreen(self, on_done=self.deiconify, primary_color=_APP_PRIMARY,
-                     show_duration_ms=3000)
+        # Auto-update: check on startup if enabled and 24h have passed.
+        # Delay past splash so we don't race the initial UI paint.
+        self.after(4000, self._maybe_check_for_updates_async)
+
+    def _apply_app_font(self):
+        """Point every named tk font, ttk style, and option-db default at
+        APP_FONT so widgets built before explicit font= kwargs still pick it up."""
+        import tkinter.font as tkfont
+        for name in ("TkDefaultFont", "TkTextFont", "TkMenuFont", "TkHeadingFont",
+                     "TkCaptionFont", "TkSmallCaptionFont", "TkIconFont",
+                     "TkTooltipFont", "TkFixedFont"):
+            try:
+                tkfont.nametofont(name).configure(family=APP_FONT)
+            except tk.TclError:
+                pass
+        try:
+            self.style.configure(".", font=(APP_FONT, 10))
+            self.style.configure("Treeview", font=(APP_FONT, 10))
+            self.style.configure("Treeview.Heading", font=(APP_FONT, 10, "bold"))
+            self.style.configure("TNotebook.Tab", font=(APP_FONT, 10))
+            self.style.configure("TButton", font=(APP_FONT, 10))
+            self.style.configure("TLabel", font=(APP_FONT, 10))
+            self.style.configure("TEntry", font=(APP_FONT, 10))
+            self.style.configure("TCombobox", font=(APP_FONT, 10))
+            self.style.configure("TCheckbutton", font=(APP_FONT, 10))
+            self.style.configure("TRadiobutton", font=(APP_FONT, 10))
+            self.style.configure("TLabelframe.Label", font=(APP_FONT, 10, "bold"))
+            self.style.configure("TMenubutton", font=(APP_FONT, 10))
+        except Exception as e:
+            logging.info(f"Could not apply ttk font: {e}")
+        # Option db — covers classic tk widgets (tk.Label, tk.Button, Listbox,
+        # Menu, Text, Entry) created without an explicit font= kwarg.
+        self.option_add("*Font", (APP_FONT, 10))
+        self.option_add("*TCombobox*Listbox.font", (APP_FONT, 10))
+
+    def _apply_rounded_buttons(self):
+        """Replace ttk button layouts with 9-slice rounded-rectangle images
+        for every bootstyle color the app uses. Preserves the ttkbootstrap
+        color scheme — only changes corner shape."""
+        if PILImage is None:
+            return
+        try:
+            from PIL import ImageDraw, ImageTk
+        except ImportError:
+            return
+
+        radius = 10
+        w, h = 220, 46
+        theme = self.style.colors
+        color_map = {}
+        for cname in ("primary", "secondary", "success", "danger",
+                      "warning", "info", "dark", "light"):
+            try:
+                color_map[cname] = getattr(theme, cname)
+            except AttributeError:
+                pass
+
+        self._rounded_btn_imgs = []  # keep PhotoImage refs alive
+
+        def _shade(hex_c: str, amount: float) -> str:
+            hex_c = hex_c.lstrip("#")
+            r = int(hex_c[0:2], 16); g = int(hex_c[2:4], 16); b = int(hex_c[4:6], 16)
+            if amount >= 0:
+                r = max(0, int(r * (1 - amount)))
+                g = max(0, int(g * (1 - amount)))
+                b = max(0, int(b * (1 - amount)))
+            else:
+                a = -amount
+                r = min(255, int(r + (255 - r) * a))
+                g = min(255, int(g + (255 - g) * a))
+                b = min(255, int(b + (255 - b) * a))
+            return f"#{r:02x}{g:02x}{b:02x}"
+
+        def _make(fill=None, border=None, bw=0):
+            img = PILImage.new("RGBA", (w, h), (0, 0, 0, 0))
+            d = ImageDraw.Draw(img)
+            kw = {}
+            if fill: kw["fill"] = fill
+            if border and bw:
+                kw["outline"] = border
+                kw["width"] = bw
+            d.rounded_rectangle((0, 0, w - 1, h - 1), radius=radius, **kw)
+            ph = ImageTk.PhotoImage(img)
+            self._rounded_btn_imgs.append(ph)
+            return ph
+
+        def _register(style_name, el_name, normal, active, pressed, disabled,
+                      fg, hover_fg=None):
+            try:
+                self.style.element_create(
+                    el_name, "image", normal,
+                    ("pressed", pressed),
+                    ("active", active),
+                    ("disabled", disabled),
+                    border=radius, sticky="nsew",
+                )
+            except tk.TclError:
+                return  # element already exists — safe to ignore
+            self.style.layout(style_name, [
+                (el_name, {"sticky": "nsew", "children": [
+                    ("Button.padding", {"sticky": "nsew", "children": [
+                        ("Button.label", {"sticky": "nsew"}),
+                    ]}),
+                ]}),
+            ])
+            self.style.configure(style_name, foreground=fg,
+                                 font=(APP_FONT, 10),
+                                 padding=(14, 7),
+                                 borderwidth=0, focuscolor="",
+                                 relief="flat")
+            if hover_fg:
+                self.style.map(style_name, foreground=[
+                    ("active", hover_fg), ("pressed", hover_fg),
+                ])
+
+        # Solid + outline per color
+        for name, color in color_map.items():
+            fg_on_color = "#ffffff" if name != "light" else "#212529"
+            _register(
+                f"{name}.TButton",
+                f"Rounded.{name}.button",
+                _make(fill=color),
+                _make(fill=_shade(color, 0.08)),
+                _make(fill=_shade(color, 0.18)),
+                _make(fill=_shade(color, -0.5)),
+                fg=fg_on_color,
+            )
+            _register(
+                f"{name}.Outline.TButton",
+                f"Rounded.{name}.Outline.button",
+                _make(fill="#ffffff", border=color, bw=2),
+                _make(fill=color, border=color, bw=2),
+                _make(fill=_shade(color, 0.15), border=_shade(color, 0.15), bw=2),
+                _make(fill="#ffffff", border=_shade(color, -0.5), bw=2),
+                fg=color,
+                hover_fg="#ffffff" if name != "light" else "#212529",
+            )
+
+        # Default (un-bootstyled) button
+        default_bg = color_map.get("light", "#f1f3f5")
+        border_c = "#ced4da"
+        _register(
+            "TButton",
+            "Rounded.default.button",
+            _make(fill=default_bg, border=border_c, bw=1),
+            _make(fill=_shade(default_bg, 0.05), border=border_c, bw=1),
+            _make(fill=_shade(default_bg, 0.12), border=border_c, bw=1),
+            _make(fill=default_bg, border=_shade(border_c, -0.3), bw=1),
+            fg="#212529",
+        )
 
     # ── UI Construction ───────────────────────────────────────
 
@@ -1460,7 +1921,7 @@ class ScandocsApp(ttk.Window):
         else:
             # Fallback text if image unavailable
             tk.Label(header, text="Speedy Scandocs", bg="#ffffff",
-                     fg="#212529", font=("Segoe UI", 15, "bold")).place(
+                     fg="#212529", font=(APP_FONT, 15, "bold")).place(
                 relx=1.0, rely=0.5, anchor="e", x=-16)
 
     # ── Tab 1: Process ────────────────────────────────────────
@@ -1499,7 +1960,7 @@ class ScandocsApp(ttk.Window):
         # btn_submit_audit visibility is toggled by _apply_audit_mode
         ttk.Label(
             right_frame, text="Reports Saved Automatically",
-            font=("", 7), foreground="gray",
+            font=(APP_FONT, 7), foreground="gray",
         ).pack(anchor="e")
 
         # Progress
@@ -1619,7 +2080,7 @@ class ScandocsApp(ttk.Window):
                 activeforeground=fg, activebackground="#f8f9fa",
                 selectcolor="#ffffff",
                 disabledforeground="#adb5bd",
-                font=("Segoe UI", 11),
+                font=(APP_FONT, 11),
                 padx=8, pady=6,
                 bd=2,
                 state=tk.DISABLED,
@@ -1657,7 +2118,7 @@ class ScandocsApp(ttk.Window):
         self.audit_rename_hint_lbl = tk.Label(
             audit_outer,
             textvariable=self.audit_rename_hint_var,
-            font=("Segoe UI", 8, "italic"),
+            font=(APP_FONT, 8, "italic"),
             fg="#777777",
             bg="#f8f9fa",
             anchor="w",
@@ -1709,7 +2170,7 @@ class ScandocsApp(ttk.Window):
         top.pack(fill=tk.X, padx=10, pady=(10, 0))
         self.review_count_var = tk.StringVar(value="Files awaiting review: 0")
         ttk.Label(top, textvariable=self.review_count_var,
-                  font=("", 10, "bold")).pack(side=tk.LEFT)
+                  font=(APP_FONT, 10, "bold")).pack(side=tk.LEFT)
         ttk.Button(top, text="Refresh", command=self._refresh_review_tab,
                    bootstyle="dark-outline").pack(side=tk.RIGHT)
         ttk.Button(top, text="Next →", command=self._review_next,
@@ -1721,7 +2182,7 @@ class ScandocsApp(ttk.Window):
         list_lf = ttk.LabelFrame(tab, text="Files Awaiting Review")
         list_lf.pack(fill=tk.BOTH, expand=True, padx=10, pady=6)
         self.review_listbox = tk.Listbox(list_lf, selectmode=tk.SINGLE,
-                                         font=("Courier", 10), exportselection=False)
+                                         font=(APP_FONT, 10), exportselection=False)
         rv_sb = ttk.Scrollbar(list_lf, orient="vertical", command=self.review_listbox.yview)
         self.review_listbox.configure(yscrollcommand=rv_sb.set)
         rv_sb.pack(side=tk.RIGHT, fill=tk.Y)
@@ -1767,7 +2228,7 @@ class ScandocsApp(ttk.Window):
         client_lb_frame.grid(row=2, column=1, padx=4, pady=(0, 4), sticky="ew")
         self.review_client_listbox = tk.Listbox(
             client_lb_frame, height=7,
-            font=("Segoe UI", 9),
+            font=(APP_FONT, 9),
             selectmode=tk.SINGLE,
             exportselection=False,
             activestyle="none",
@@ -1830,7 +2291,7 @@ class ScandocsApp(ttk.Window):
         list_frame = ttk.Frame(tab)
         list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
         self.client_listbox = tk.Listbox(
-            list_frame, selectmode=tk.SINGLE, font=("Courier", 10)
+            list_frame, selectmode=tk.SINGLE, font=(APP_FONT, 10)
         )
         cl_sb = ttk.Scrollbar(list_frame, orient="vertical",
                                command=self.client_listbox.yview)
@@ -1861,7 +2322,7 @@ class ScandocsApp(ttk.Window):
         # Dynamic "Add X to list" suggestion — shown when typed name is not yet in the list
         self._add_suggestion_lbl = tk.Label(
             tab, text="", fg="#1565c0", bg="#ffffff",
-            font=("Segoe UI", 9, "underline"), cursor="hand2", anchor="w",
+            font=(APP_FONT, 9, "underline"), cursor="hand2", anchor="w",
         )
         self._add_suggestion_lbl.pack(fill=tk.X, padx=12, pady=(0, 2))
         self._add_suggestion_lbl.bind("<Button-1>", lambda _: self._add_client())
@@ -1882,6 +2343,12 @@ class ScandocsApp(ttk.Window):
     def _build_settings_tab(self):
         tab = ttk.Frame(self.notebook)
         self.notebook.add(tab, text="  Settings  ")
+
+        # ── Pinned footer (always visible at the bottom) ──────
+        # Pack BEFORE the scroll canvas so pack reserves its space first.
+        _footer_frame = ttk.Frame(tab, padding=(20, 8, 20, 10))
+        _footer_frame.pack(side=tk.BOTTOM, fill=tk.X)
+        ttk.Separator(tab, orient="horizontal").pack(side=tk.BOTTOM, fill=tk.X)
 
         # ── Scrollable wrapper ────────────────────────────────
         _scroll_canvas = tk.Canvas(tab, highlightthickness=0)
@@ -2037,8 +2504,100 @@ class ScandocsApp(ttk.Window):
         ttk.Label(
             proc_lf,
             text="  When unchecked, medium-confidence results are also renamed (more matches, higher false-positive risk)",
-            font=("Segoe UI", 8), foreground="gray",
+            font=(APP_FONT, 8), foreground="gray",
         ).grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+        self.s_ocr_preprocess_var = tk.BooleanVar(value=True)
+        ttk.Checkbutton(
+            proc_lf,
+            text="Preprocess scans before OCR — improves accuracy on messy/low-DPI scans (recommended)",
+            variable=self.s_ocr_preprocess_var,
+        ).grid(row=8, column=0, columnspan=3, sticky="w", padx=8, pady=(4, 0))
+        ttk.Button(
+            proc_lf, text="?", width=2,
+            command=lambda: messagebox.showinfo("Preprocess Scans Before OCR",
+                "Preprocess Scans Before OCR\n\n"
+                "When enabled, each page image is cleaned up before it reaches "
+                "Tesseract:\n\n"
+                "  • Upscale — small/low-DPI scans are enlarged toward 300 DPI\n"
+                "  • Autocontrast — normalizes faded or shadowed pages\n"
+                "  • Binarize — converts the image to pure black and white so "
+                "ink stands out from paper texture\n\n"
+                "This usually improves OCR accuracy on real-world scans but adds "
+                "a small amount of time per page. Turn it off if you notice "
+                "worse results on already-clean digital PDFs."),
+            bootstyle="primary-outline",
+        ).grid(row=8, column=3, padx=(0, 4), pady=(4, 0))
+        ttk.Label(
+            proc_lf,
+            text="  Upscales, normalizes contrast, and binarizes each page image — adds ~100–300ms per page",
+            font=(APP_FONT, 8), foreground="gray",
+        ).grid(row=9, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+
+        # ── Text Extraction Method (OCR vs Vision) ────────────────
+        self.s_extraction_method_var = tk.StringVar()
+        self.s_max_vision_pages_var = tk.StringVar()
+
+        ttk.Label(proc_lf, text="Text Extraction Method:").grid(
+            row=5, column=0, sticky="w", pady=5
+        )
+        self.s_method_combo = ttk.Combobox(
+            proc_lf,
+            textvariable=self.s_extraction_method_var,
+            values=["Use OCR", "Use Vision Model"],
+            state="readonly",
+            width=44,
+        )
+        self.s_method_combo.grid(row=5, column=1, sticky="ew", padx=(8, 4))
+        self.s_method_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._apply_extraction_method_ui()
+        )
+        ttk.Button(
+            proc_lf, text="?", width=2,
+            command=lambda: messagebox.showinfo("Text Extraction Method",
+                "Text Extraction Method\n\n"
+                "Use OCR (default): extracts text from documents with Tesseract OCR "
+                "and sends the text to the AI model. Fast and reliable for clean scans.\n\n"
+                "Use Vision Model: sends the first few page images directly to a "
+                "vision-capable model (Llama 3.2 Vision, Gemma 4). Can help on "
+                "low-quality scans, stamps, and letterheads, but is slower.\n\n"
+                "Vision Model is only selectable when the currently chosen model "
+                "supports vision. Cloud variants are disabled to keep client "
+                "documents on-device."),
+            bootstyle="primary-outline",
+        ).grid(row=5, column=3, padx=(0, 4))
+
+        ttk.Label(proc_lf, text="Max Vision Pages:").grid(
+            row=6, column=0, sticky="w", pady=5
+        )
+        self.s_vision_pages_entry = ttk.Entry(
+            proc_lf, textvariable=self.s_max_vision_pages_var, width=46
+        )
+        self.s_vision_pages_entry.grid(row=6, column=1, sticky="ew", padx=(8, 4))
+        ttk.Button(
+            proc_lf, text="?", width=2,
+            command=lambda: messagebox.showinfo("Max Vision Pages",
+                "Max Vision Pages\n\n"
+                "How many pages from each PDF are sent to the vision model. "
+                "Each page is an image, so this is much more expensive than OCR "
+                "— keep it low (1–2 is usually plenty to find the client name).\n\n"
+                "Only applies when 'Use Vision Model' is selected."),
+            bootstyle="primary-outline",
+        ).grid(row=6, column=3, padx=(0, 4))
+
+        self._method_hint_lbl = ttk.Label(
+            proc_lf, text="", font=(APP_FONT, 8), foreground="gray",
+        )
+        self._method_hint_lbl.grid(row=7, column=0, columnspan=4,
+                                    sticky="w", padx=8, pady=(0, 6))
+
+        # Re-evaluate vision availability when the user changes the model
+        self.s_model_combo.bind(
+            "<<ComboboxSelected>>", lambda _e: self._apply_extraction_method_ui()
+        )
+        self.s_model_var.trace_add(
+            "write", lambda *_: self._apply_extraction_method_ui()
+        )
 
         # Reports
         rep_lf = ttk.LabelFrame(outer, text="Reports")
@@ -2128,7 +2687,7 @@ class ScandocsApp(ttk.Window):
             self._fm_suggest_frame,
             text="Coming Soon",
             foreground="#999999",
-            font=("Segoe UI", 8, "italic"),
+            font=(APP_FONT, 8, "italic"),
         ).pack(side=tk.LEFT)
 
         # ── Auto-commit stub (Coming Soon) ────────────────────────
@@ -2145,12 +2704,12 @@ class ScandocsApp(ttk.Window):
             self._fm_autocommit_frame,
             text="Coming Soon — The tool will file documents automatically without human oversight.",
             foreground="#999999",
-            font=("Segoe UI", 8, "italic"),
+            font=(APP_FONT, 8, "italic"),
         ).pack(side=tk.LEFT)
 
-        # Buttons + status
-        btn_row = ttk.Frame(outer)
-        btn_row.pack(fill=tk.X, pady=6)
+        # Buttons + status — pinned to footer so they're always visible
+        btn_row = ttk.Frame(_footer_frame)
+        btn_row.pack(fill=tk.X)
         self._btn_test_conn = ttk.Button(btn_row, text="Test API Connection",
                    command=self._test_connection,
                    bootstyle="primary-outline")
@@ -2162,6 +2721,19 @@ class ScandocsApp(ttk.Window):
         self.conn_status_var = tk.StringVar(value="")
         self.conn_label = ttk.Label(btn_row, textvariable=self.conn_status_var)
         self.conn_label.pack(side=tk.LEFT, padx=14)
+
+        # Version + update controls — right-aligned on the same footer row
+        self._btn_check_updates = ttk.Button(
+            btn_row, text="Check for Updates",
+            command=lambda: self._check_for_updates_async(silent=False),
+            bootstyle="secondary-outline",
+        )
+        self._btn_check_updates.pack(side=tk.RIGHT)
+        ttk.Label(
+            btn_row, text=f"v{APP_VERSION}",
+            foreground="#888888",
+            font=(APP_FONT, 9),
+        ).pack(side=tk.RIGHT, padx=(0, 12))
 
     # ── Settings helpers ──────────────────────────────────────
 
@@ -2188,6 +2760,16 @@ class ScandocsApp(ttk.Window):
         self.s_suggest_parent_var.set(cfg["processing"].get("suggest_location_parent_folder", ""))
         self.s_max_pages_var.set(str(cfg["processing"].get("max_pages", 5)))
         self.s_require_high_conf_var.set(cfg["processing"].get("require_high_confidence", True))
+        self.s_ocr_preprocess_var.set(cfg["processing"].get("ocr_preprocess", True))
+        # Extraction method
+        _method = cfg["processing"].get("extraction_method", "ocr")
+        self.s_extraction_method_var.set(
+            "Use Vision Model" if _method == "vision" else "Use OCR"
+        )
+        self.s_max_vision_pages_var.set(
+            str(cfg["processing"].get("max_vision_pages", 2))
+        )
+        self.after(0, self._apply_extraction_method_ui)
         self.after(0, self._apply_audit_mode)
         self.after(0, self._apply_file_mode)
         self.after(400, self._apply_round_styling)
@@ -2205,6 +2787,12 @@ class ScandocsApp(ttk.Window):
             max_pages = int(self.s_max_pages_var.get())
             if max_pages < 1:
                 raise ValueError("Max pages must be at least 1.")
+            try:
+                max_vision_pages = int(self.s_max_vision_pages_var.get())
+            except ValueError:
+                raise ValueError("Max Vision Pages must be a whole number.")
+            if max_vision_pages < 1:
+                raise ValueError("Max Vision Pages must be at least 1.")
         except ValueError as e:
             messagebox.showerror("Invalid Value", str(e))
             return
@@ -2231,6 +2819,14 @@ class ScandocsApp(ttk.Window):
         cfg["processing"]["suggest_location_enabled"]     = self.s_suggest_loc_var.get()
         cfg["processing"]["suggest_location_parent_folder"] = self.s_suggest_parent_var.get().strip()
         cfg["processing"]["require_high_confidence"]       = self.s_require_high_conf_var.get()
+        cfg["processing"]["ocr_preprocess"]                = self.s_ocr_preprocess_var.get()
+        # Extraction method — force OCR if the selected model can't do vision
+        _method_label = self.s_extraction_method_var.get()
+        _method = "vision" if _method_label == "Use Vision Model" else "ocr"
+        if _method == "vision" and not model_supports_vision(cfg["api"]["model"]):
+            _method = "ocr"
+        cfg["processing"]["extraction_method"] = _method
+        cfg["processing"]["max_vision_pages"]  = max_vision_pages
         self.config_mgr.save(cfg)
         self._apply_audit_mode()
         self._apply_file_mode()
@@ -2885,6 +3481,47 @@ class ScandocsApp(ttk.Window):
     def _audit_mode_on(self) -> bool:
         return self.s_audit_mode_var.get()
 
+    def _apply_extraction_method_ui(self):
+        """Enable/disable the extraction-method dropdown based on whether the
+        currently selected model is vision-capable. Also greys out the
+        Max Vision Pages entry when OCR mode is selected."""
+        if not hasattr(self, "s_method_combo"):
+            return
+        model = self.s_model_var.get().strip()
+        vision_ok = model_supports_vision(model)
+
+        if vision_ok:
+            self.s_method_combo.configure(
+                values=["Use OCR", "Use Vision Model"], state="readonly"
+            )
+            self._method_hint_lbl.configure(
+                text=f"  '{model}' supports vision — both modes available."
+            )
+        else:
+            # Force OCR and lock the dropdown
+            if self.s_extraction_method_var.get() == "Use Vision Model":
+                self.s_extraction_method_var.set("Use OCR")
+            self.s_method_combo.configure(
+                values=["Use OCR"], state="disabled"
+            )
+            if model:
+                self._method_hint_lbl.configure(
+                    text=f"  '{model}' is not on the vision allowlist "
+                         f"(llama3.2-vision, gemma4). Vision mode disabled."
+                )
+            else:
+                self._method_hint_lbl.configure(
+                    text="  Select a model first. Vision mode requires "
+                         "llama3.2-vision or gemma4."
+                )
+
+        # Grey out Max Vision Pages when not in vision mode
+        in_vision = self.s_extraction_method_var.get() == "Use Vision Model"
+        if hasattr(self, "s_vision_pages_entry"):
+            self.s_vision_pages_entry.configure(
+                state=("normal" if in_vision else "disabled")
+            )
+
     def _apply_file_mode(self):
         """Show or hide File Mode panels based on the master toggle and per-tab sub-settings."""
         master_on = self.s_file_mode_var.get()
@@ -3304,7 +3941,7 @@ class ScandocsApp(ttk.Window):
             ttk.Label(
                 dlg,
                 text="You finished the audit.\nWould you like to submit the audit now?",
-                font=("Segoe UI", 11),
+                font=(APP_FONT, 11),
                 anchor="center",
                 justify="center",
             ).pack(pady=(24, 16))
@@ -3540,9 +4177,9 @@ class ScandocsApp(ttk.Window):
         dialog.geometry(f"520x160+{x}+{y}")
 
         ttk.Label(dialog, text="What should this file be named?",
-                  font=("Segoe UI", 10, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
+                  font=(APP_FONT, 10, "bold")).pack(anchor="w", padx=16, pady=(16, 4))
         ttk.Label(dialog, text="Include the file extension  (e.g. GARCIA, Maria - Invoice.pdf)",
-                  foreground="gray", font=("Segoe UI", 8)).pack(anchor="w", padx=16)
+                  foreground="gray", font=(APP_FONT, 8)).pack(anchor="w", padx=16)
 
         entry_var = tk.StringVar(value=result.audit_corrected_name or result.final_name)
         entry = ttk.Entry(dialog, textvariable=entry_var, width=62)
@@ -4045,6 +4682,188 @@ class ScandocsApp(ttk.Window):
         )
         self.notebook.select(3)  # open Settings tab
 
+    # ── Auto-update ───────────────────────────────────────────
+
+    def _maybe_check_for_updates_async(self):
+        """Called on startup. Skips the check if disabled or if <24h since
+        the last attempt. Runs the actual network call on a daemon thread
+        so we never block the UI."""
+        cfg = self.config_mgr.config.get("updates", {})
+        if not cfg.get("check_on_startup", True):
+            return
+        last = cfg.get("last_check_iso") or ""
+        if last:
+            try:
+                last_dt = datetime.datetime.fromisoformat(last)
+                elapsed = (datetime.datetime.now() - last_dt).total_seconds()
+                if elapsed < UPDATE_CHECK_INTERVAL_SEC:
+                    return
+            except ValueError:
+                pass
+        self._check_for_updates_async(silent=True)
+
+    def _check_for_updates_async(self, silent: bool = False):
+        """Kick off the release lookup on a background thread.
+        silent=True: no popup if we're up-to-date or offline.
+        silent=False (manual "Check now"): always inform the user."""
+        t = threading.Thread(
+            target=self._do_update_check, args=(silent,), daemon=True,
+        )
+        t.start()
+
+    def _do_update_check(self, silent: bool):
+        release = fetch_latest_release()
+        # Always stamp the last_check even if the network failed — prevents
+        # us from hammering GitHub in a loop if the user is offline.
+        self.config_mgr.config["updates"]["last_check_iso"] = \
+            datetime.datetime.now().isoformat(timespec="seconds")
+        try:
+            self.config_mgr.save()
+        except Exception:
+            pass
+
+        if not release:
+            if not silent:
+                self.after(0, lambda: messagebox.showwarning(
+                    "Check for Updates",
+                    "Couldn't reach the update server.\n"
+                    "Check your internet connection and try again."))
+            return
+
+        tag = release.get("tag_name") or ""
+        latest = _parse_version(tag)
+        current = _parse_version(APP_VERSION)
+        if latest <= current:
+            if not silent:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Check for Updates",
+                    f"You're up to date.\n\nInstalled version: {APP_VERSION}"))
+            return
+
+        asset = _pick_release_asset(release)
+        if not asset:
+            if not silent:
+                self.after(0, lambda: messagebox.showinfo(
+                    "Update Available",
+                    f"Version {tag} is available, but no installer was found "
+                    "for this platform. Visit the Releases page to download "
+                    "it manually."))
+            return
+
+        # Respect a "skip this version" choice from a previous prompt.
+        skip = self.config_mgr.config["updates"].get("skip_version", "")
+        if silent and skip == tag:
+            return
+
+        notes = (release.get("body") or "").strip()
+        self.after(0, lambda: self._prompt_update(tag, asset, notes))
+
+    def _prompt_update(self, tag: str, asset: dict, notes: str):
+        """Ask the user whether to install the newer version now."""
+        short_notes = notes if len(notes) < 600 else notes[:600].rstrip() + "…"
+        message = (
+            f"A new version of Speedy Scandocs is available.\n\n"
+            f"Installed: {APP_VERSION}\n"
+            f"Available: {tag.lstrip('vV')}\n\n"
+        )
+        if short_notes:
+            message += f"What's new:\n{short_notes}\n\n"
+        message += "Install now?\n\n(The app will close and the installer will open.)"
+
+        # yesnocancel: Yes = install, No = remind later, Cancel = skip this version
+        resp = messagebox.askyesnocancel("Update Available", message)
+        if resp is None:
+            self.config_mgr.config["updates"]["skip_version"] = tag
+            self.config_mgr.save()
+            return
+        if resp is False:
+            return
+        self._download_and_install(asset)
+
+    def _download_and_install(self, asset: dict):
+        """Show a progress dialog, stream the installer to a temp file,
+        then launch it and exit the app."""
+        import tempfile
+        url = asset.get("browser_download_url")
+        name = asset.get("name") or "SpeedyScandocsInstaller"
+        if not url:
+            return
+        dest = os.path.join(tempfile.gettempdir(), name)
+
+        # Progress dialog
+        dlg = tk.Toplevel(self)
+        dlg.title("Downloading Update")
+        dlg.geometry("420x140")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        ttk.Label(dlg, text=f"Downloading {name}…", padding=(15, 12, 15, 0)).pack(anchor="w")
+        pbar = ttk.Progressbar(dlg, mode="determinate", maximum=100, length=390)
+        pbar.pack(padx=15, pady=10)
+        status_var = tk.StringVar(value="Starting…")
+        ttk.Label(dlg, textvariable=status_var, padding=(15, 0)).pack(anchor="w")
+
+        cancelled = {"v": False}
+        def _cancel():
+            cancelled["v"] = True
+            dlg.destroy()
+        cancel_btn = ttk.Button(dlg, text="Cancel", command=_cancel,
+                                bootstyle="secondary-outline")
+        cancel_btn.pack(pady=6)
+
+        def _progress(done, total):
+            pct = int(done * 100 / total) if total else 0
+            mb_done = done / (1024 * 1024)
+            mb_total = total / (1024 * 1024) if total else 0
+            self.after(0, lambda: (
+                pbar.configure(value=pct),
+                status_var.set(
+                    f"{mb_done:.1f} MB / {mb_total:.1f} MB ({pct}%)"
+                    if total else f"{mb_done:.1f} MB"
+                ),
+            ))
+
+        def _worker():
+            ok = download_file(url, dest, progress_cb=_progress,
+                               cancel_flag=lambda: cancelled["v"])
+            self.after(0, lambda: self._on_download_done(dlg, ok, dest, cancelled["v"]))
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_download_done(self, dlg, ok: bool, path: str, was_cancelled: bool):
+        try:
+            dlg.destroy()
+        except Exception:
+            pass
+        if was_cancelled:
+            return
+        if not ok:
+            messagebox.showerror(
+                "Update Failed",
+                "The update could not be downloaded. Please try again later "
+                "or download the installer manually from the Releases page.",
+            )
+            return
+        try:
+            if sys.platform == "win32":
+                # Inno Setup installer handles UAC + overwrite-in-place itself.
+                os.startfile(path)
+            elif sys.platform == "darwin":
+                # Opens the DMG in Finder; user drags the new .app to
+                # Applications. Not seamless, but the standard Mac pattern.
+                subprocess.Popen(["open", path])
+            else:
+                _open_file(path)
+        except Exception as e:
+            messagebox.showerror(
+                "Update Failed",
+                f"Could not launch the installer:\n{e}\n\n"
+                f"Installer location:\n{path}",
+            )
+            return
+        # Give the installer a moment to spawn before we exit.
+        self.after(600, self._on_close)
+
 
 # ─────────────────────────────────────────────────────────────
 # Entry point
@@ -4074,6 +4893,8 @@ if __name__ == "__main__":
         _missing_dep_error("PyMuPDF")
     if requests is None:
         _missing_dep_error("requests")
+
+    _load_bundled_fonts()
 
     app = ScandocsApp()
     app.mainloop()
