@@ -78,6 +78,18 @@ jobs:
       - name: Build with PyInstaller
         run: pyinstaller build/mac/scandocs_mac.spec --clean -y
 
+      - name: Ad-hoc sign the .app
+        # Ad-hoc signing (no Apple Developer cert) gives the bundle a stable
+        # code-design identity. It does NOT bypass Gatekeeper — users still
+        # need to "Open Anyway" once via Privacy & Security on first launch
+        # — but it reduces the "SpeedyScandocs is damaged and can't be opened"
+        # error on Apple Silicon, which strikes unsigned PyInstaller bundles.
+        # When we move to a paid Developer ID + notarization, replace this
+        # step with codesign using the real identity + xcrun notarytool.
+        run: |
+          codesign --force --deep --sign - dist/SpeedyScandocs.app
+          codesign --verify --verbose dist/SpeedyScandocs.app
+
       - name: Install create-dmg
         run: brew install create-dmg
 
