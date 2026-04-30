@@ -71,7 +71,7 @@ ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 # APP_VERSION is bumped by build/release.py — keep it in sync with the
 # installer.iss AppVersion. Auto-update checks GitHub Releases on UPDATE_REPO
 # and compares the latest tag (vX.Y.Z) against APP_VERSION.
-APP_VERSION = "1.8.0"
+APP_VERSION = "1.8.1"
 UPDATE_REPO = "treyj1/Speedy-Scandocs"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60   # 24 hours
@@ -265,6 +265,14 @@ VISION_MODEL_PREFIXES = [
     "gemma4",           # latest, e2b, e4b, 26b, 31b (local variants)
 ]
 VISION_MODEL_EXCLUSIONS = ["-cloud", ":cloud"]
+
+
+def _disable_combobox_scroll(widget) -> None:
+    """Stop a ttk.Combobox from cycling values when the mouse wheel scrolls
+    over it. Otherwise an accidental scroll while hovering Settings can flip
+    Use OCR ↔ Use Vision Model without the user realizing."""
+    for seq in ("<MouseWheel>", "<Button-4>", "<Button-5>"):
+        widget.bind(seq, lambda _e: "break")
 
 
 def model_supports_vision(model_name: str) -> bool:
@@ -2440,9 +2448,11 @@ class ScandocsApp(ttk.Window):
         ttk.Label(api_lf, text="Model:").grid(row=2, column=0, sticky="w", pady=5)
         self.s_model_combo = ttk.Combobox(
             api_lf, textvariable=self.s_model_var,
-            values=_FALLBACK_MODELS, width=44
+            values=_FALLBACK_MODELS, width=44,
+            state="readonly",
         )
         self.s_model_combo.grid(row=2, column=1, sticky="ew", padx=(8, 4))
+        _disable_combobox_scroll(self.s_model_combo)
         ttk.Button(
             api_lf, text="⟳", width=3,
             command=self._refresh_models,
@@ -2549,6 +2559,7 @@ class ScandocsApp(ttk.Window):
             width=44,
         )
         self.s_method_combo.grid(row=5, column=1, sticky="ew", padx=(8, 4))
+        _disable_combobox_scroll(self.s_method_combo)
         self.s_method_combo.bind(
             "<<ComboboxSelected>>", lambda _e: self._apply_extraction_method_ui()
         )
