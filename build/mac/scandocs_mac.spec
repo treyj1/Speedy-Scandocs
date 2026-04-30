@@ -51,7 +51,9 @@ a = Analysis(
     ],
     datas=[
         (os.path.join(ROOT, 'assets'),          'assets'),
-        (os.path.join(ROOT, 'client_list.txt'), '.'),
+        # Client list is intentionally NOT bundled — it's real PII and must
+        # never ship in the public installer. The user points Settings at
+        # their own client_list.txt at install time.
         (TESS_ENG, 'tessdata'),                 # English language data
         (TESS_OSD, 'tessdata'),                 # Script detection data
     ],

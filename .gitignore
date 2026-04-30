@@ -9,8 +9,16 @@ __pycache__/
 # User-specific config (contains hardcoded local paths)
 config.json
 
+# Client list (real client PII — must never be committed)
+client_list.txt
+Client List.xlsx
+*.client_list.txt
+
 # Sample/working documents (may contain real client data)
 sample_docs/
+
+# Runtime markers
+.deps_installed
 
 # Generated reports (may contain client data)
 Reports/

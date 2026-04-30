@@ -98,12 +98,6 @@ if getattr(sys, "frozen", False):
         _appdata = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
     _USER_DATA_DIR = os.path.join(_appdata, "SpeedyScandocs")
     os.makedirs(_USER_DATA_DIR, exist_ok=True)
-    # Copy default client list on first run so the user can edit it
-    _bundled_cl = os.path.join(SCRIPT_DIR, "client_list.txt")
-    _user_cl    = os.path.join(_USER_DATA_DIR, "client_list.txt")
-    if not os.path.exists(_user_cl) and os.path.exists(_bundled_cl):
-        import shutil as _shutil
-        _shutil.copy2(_bundled_cl, _user_cl)
 else:
     _USER_DATA_DIR = SCRIPT_DIR
 
