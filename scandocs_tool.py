@@ -71,7 +71,7 @@ ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 # APP_VERSION is bumped by build/release.py — keep it in sync with the
 # installer.iss AppVersion. Auto-update checks GitHub Releases on UPDATE_REPO
 # and compares the latest tag (vX.Y.Z) against APP_VERSION.
-APP_VERSION = "1.8.3"
+APP_VERSION = "1.8.4"
 UPDATE_REPO = "treyj1/Speedy-Scandocs"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60   # 24 hours
@@ -1899,6 +1899,18 @@ class ScandocsApp(ttk.Window):
         self._build_review_tab()
         self._build_clients_tab()
         self._build_settings_tab()
+        self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+
+    def _on_tab_changed(self, _evt=None):
+        # Reload the Client List tab whenever it becomes active, so it reflects
+        # the currently-configured client_list_file (handles the case where the
+        # path was set/changed in Settings after startup).
+        try:
+            current = self.notebook.nametowidget(self.notebook.select())
+        except Exception:
+            return
+        if getattr(self, "_clients_tab", None) is current:
+            self._refresh_client_list_tab()
 
     def _build_header(self):
         """Header bar: Speedy Scandocs logo PNG, right-aligned."""
@@ -2295,6 +2307,7 @@ class ScandocsApp(ttk.Window):
 
     def _build_clients_tab(self):
         tab = ttk.Frame(self.notebook)
+        self._clients_tab = tab
         self.notebook.add(tab, text="  Client List  ")
 
         ttk.Label(
@@ -2849,6 +2862,7 @@ class ScandocsApp(ttk.Window):
         self.config_mgr.save(cfg)
         self._apply_audit_mode()
         self._apply_file_mode()
+        self._refresh_client_list_tab()
         messagebox.showinfo("Saved", "Settings saved successfully.")
 
     def _browse_dir(self, var: tk.StringVar):
