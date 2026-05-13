@@ -71,7 +71,7 @@ ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 # APP_VERSION is bumped by build/release.py — keep it in sync with the
 # installer.iss AppVersion. Auto-update checks GitHub Releases on UPDATE_REPO
 # and compares the latest tag (vX.Y.Z) against APP_VERSION.
-APP_VERSION = "1.8.4"
+APP_VERSION = "1.8.5"
 UPDATE_REPO = "treyj1/Speedy-Scandocs"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60   # 24 hours
@@ -1700,6 +1700,7 @@ class ScandocsApp(ttk.Window):
         self._apply_rounded_buttons()
         self._load_settings_to_ui()
         self._refresh_client_list_tab()
+        self._refresh_unnamed_count()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         # Set icon after ttkbootstrap finishes its own setup to prevent it being overridden
         self.after(100, self._set_window_icon)
@@ -1902,15 +1903,45 @@ class ScandocsApp(ttk.Window):
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
 
     def _on_tab_changed(self, _evt=None):
-        # Reload the Client List tab whenever it becomes active, so it reflects
-        # the currently-configured client_list_file (handles the case where the
-        # path was set/changed in Settings after startup).
+        # Refresh each tab when it becomes active so it always reflects the
+        # current scandocs folder / client list on disk.
         try:
             current = self.notebook.nametowidget(self.notebook.select())
         except Exception:
             return
-        if getattr(self, "_clients_tab", None) is current:
+        if getattr(self, "_process_tab", None) is current:
+            self._refresh_unnamed_count()
+        elif getattr(self, "_review_tab", None) is current:
+            self._refresh_review_tab()
+        elif getattr(self, "_clients_tab", None) is current:
             self._refresh_client_list_tab()
+
+    def _refresh_unnamed_count(self):
+        """Count files in the scandocs folder that don't yet match the
+        'LAST, First - Subject.ext' format, and show it on the Auto-Process tab."""
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        if not scandocs or not os.path.isdir(scandocs):
+            self.unnamed_count_var.set("Scandocs folder not configured or not found.")
+            return
+        client_list_path = self.config_mgr.config["paths"]["client_list_file"]
+        client_list = ClientListManager.load(client_list_path)
+        try:
+            unnamed = [
+                f for f in os.listdir(scandocs)
+                if os.path.isfile(os.path.join(scandocs, f))
+                and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+                and not FileProcessor._already_processed(f, client_list)
+            ]
+        except OSError as e:
+            self.unnamed_count_var.set(f"Could not read scandocs folder: {e}")
+            return
+        n = len(unnamed)
+        if n == 0:
+            self.unnamed_count_var.set("No unnamed files in scandocs folder.")
+        elif n == 1:
+            self.unnamed_count_var.set("1 unnamed file ready to process.")
+        else:
+            self.unnamed_count_var.set(f"{n} unnamed files ready to process.")
 
     def _build_header(self):
         """Header bar: Speedy Scandocs logo PNG, right-aligned."""
@@ -1957,6 +1988,7 @@ class ScandocsApp(ttk.Window):
     def _build_process_tab(self):
         self.style.configure("AutoTab.TFrame", background="#e3f2fd")
         tab = ttk.Frame(self.notebook, style="AutoTab.TFrame")
+        self._process_tab = tab
         self.notebook.add(tab, text="  Auto-Process  ")
         # Accent bar
         tk.Frame(tab, bg=_APP_PRIMARY, height=6).pack(fill=tk.X)
@@ -1990,6 +2022,14 @@ class ScandocsApp(ttk.Window):
             right_frame, text="Reports Saved Automatically",
             font=(APP_FONT, 7), foreground="gray",
         ).pack(anchor="e")
+
+        # Unnamed-files indicator (refreshes when this tab is selected)
+        self.unnamed_count_var = tk.StringVar(value="")
+        ttk.Label(
+            tab, textvariable=self.unnamed_count_var,
+            font=(APP_FONT, 10, "bold"), foreground="#1565c0",
+            anchor="w",
+        ).pack(fill=tk.X, padx=10, pady=(2, 0))
 
         # Progress
         prog_frame = ttk.Frame(tab)
@@ -2191,6 +2231,7 @@ class ScandocsApp(ttk.Window):
 
     def _build_review_tab(self):
         tab = ttk.Frame(self.notebook)
+        self._review_tab = tab
         self.notebook.add(tab, text="  Manual Entry  ")
         tk.Frame(tab, bg=_APP_PRIMARY, height=5).pack(fill=tk.X)
 
@@ -2863,6 +2904,7 @@ class ScandocsApp(ttk.Window):
         self._apply_audit_mode()
         self._apply_file_mode()
         self._refresh_client_list_tab()
+        self._refresh_unnamed_count()
         messagebox.showinfo("Saved", "Settings saved successfully.")
 
     def _browse_dir(self, var: tk.StringVar):
@@ -3253,6 +3295,7 @@ class ScandocsApp(ttk.Window):
                     )
                     self._finish_processing(auto_save=True)
                     self._refresh_review_tab()
+                    self._refresh_unnamed_count()
                     return
 
         except queue.Empty:
