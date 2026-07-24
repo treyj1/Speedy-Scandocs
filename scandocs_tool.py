@@ -71,7 +71,7 @@ ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 # APP_VERSION is bumped by build/release.py — keep it in sync with the
 # installer.iss AppVersion. Auto-update checks GitHub Releases on UPDATE_REPO
 # and compares the latest tag (vX.Y.Z) against APP_VERSION.
-APP_VERSION = "1.8.5"
+APP_VERSION = "1.9.0"
 UPDATE_REPO = "treyj1/Speedy-Scandocs"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60   # 24 hours
@@ -244,6 +244,7 @@ DEFAULT_CONFIG: dict = {
         "suggest_location_parent_folder": "",
         "auto_commit_moves": False,
         "candidate_list_size": 10,
+        "show_manual_entry_tab": False,  # legacy standalone Manual Entry tab
         "extraction_method": "ocr",   # "ocr" or "vision"
         "max_vision_pages": 2,          # pages sent to vision model per doc
         "ocr_preprocess": True,         # upscale/binarize/autocontrast before OCR
@@ -256,6 +257,10 @@ DEFAULT_CONFIG: dict = {
         "check_on_startup": True,
         "last_check_iso": "",
         "skip_version": "",
+    },
+    "ui": {
+        "preview_popup_width": 0,   # 0 = not yet set by the user; use the default large size
+        "preview_popup_height": 0,
     },
 }
 
@@ -354,6 +359,7 @@ class ConfigManager:
             merged["processing"].update(data.get("processing", {}))
             merged["reports"].update(data.get("reports", {}))
             merged["updates"].update(data.get("updates", {}))
+            merged["ui"].update(data.get("ui", {}))
             return merged
         except Exception as e:
             logging.warning(f"Could not load config.json: {e}. Using defaults.")
@@ -1646,6 +1652,12 @@ def download_file(url: str, dest_path: str,
 
 class ScandocsApp(ttk.Window):
 
+    def report_callback_exception(self, exc, val, tb):
+        """Tkinter normally prints callback exceptions to stderr, which is
+        invisible when the app is launched without a console — silently
+        swallowing bugs in button commands etc. Log them instead."""
+        logging.error("Unhandled exception in a UI callback", exc_info=(exc, val, tb))
+
     def __init__(self):
         super().__init__(themename="litera")
         self.withdraw()               # hidden until splash finishes
@@ -1661,6 +1673,7 @@ class ScandocsApp(ttk.Window):
         self._results: list = []
         self._total_files: int = 0
         self._iid_to_result: dict = {}   # treeview item id → ProcessResult
+        self._correction_buttons: dict = {}  # treeview item id → overlaid "Manual Correction" button
         self._audit_updating: bool = False  # prevent recursive checkbox callbacks
         self.fo_dest_var = tk.StringVar()        # file-mode destination folder
         self.s_file_mode_auto_var      = tk.BooleanVar(value=True)
@@ -1668,8 +1681,11 @@ class ScandocsApp(ttk.Window):
         self.s_suggest_loc_var         = tk.BooleanVar(value=False)
         self.s_suggest_parent_var      = tk.StringVar(value="")
         self.s_require_high_conf_var   = tk.BooleanVar(value=True)
+        self.s_show_manual_tab_var     = tk.BooleanVar(value=False)
         self._all_clients: list = []        # full client list for combo filtering
-        self._review_selected_file: str = ""  # last file chosen in Manual Entry list
+        self._correction_iid: str = ""      # results_tree row id currently under Manual Correction
+        self._pre_correction_height: Optional[int] = None  # window height before growing for the panel
+        self._review_selected_file: str = ""  # last file chosen in the legacy Manual Entry list
         self._sort_col: str = ""            # treeview column currently sorted
         self._sort_reverse: bool = False    # ascending=False, descending=True
         self._file_popup = None             # currently open document preview Toplevel
@@ -1897,7 +1913,7 @@ class ScandocsApp(ttk.Window):
         self.notebook = ttk.Notebook(self)
         self.notebook.pack(fill=tk.BOTH, expand=True, padx=8, pady=(0, 8))
         self._build_process_tab()
-        self._build_review_tab()
+        self._build_review_tab()   # legacy Manual Entry tab — attached/detached via Settings toggle
         self._build_clients_tab()
         self._build_settings_tab()
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
@@ -1989,7 +2005,8 @@ class ScandocsApp(ttk.Window):
         self.style.configure("AutoTab.TFrame", background="#e3f2fd")
         tab = ttk.Frame(self.notebook, style="AutoTab.TFrame")
         self._process_tab = tab
-        self.notebook.add(tab, text="  Auto-Process  ")
+        self._process_tab_frame = tab
+        self.notebook.add(tab, text="  Process  ")
         # Accent bar
         tk.Frame(tab, bg=_APP_PRIMARY, height=6).pack(fill=tk.X)
 
@@ -2047,7 +2064,7 @@ class ScandocsApp(ttk.Window):
 
         # Results table
         cols = ("audited", "original", "new_name", "status", "client",
-                "new_location")
+                "new_location", "correction")
         col_cfg = {
             "audited":      ("✓",              32),
             "original":     ("Original File",  180),
@@ -2055,8 +2072,10 @@ class ScandocsApp(ttk.Window):
             "status":       ("Status",           75),
             "client":       ("Client",          170),
             "new_location": ("New Location",    130),
+            "correction":   ("",                 160),
         }
         tree_frame = ttk.Frame(tab)
+        self._tree_frame = tree_frame   # stable pack anchor — always packed, unlike audit_panel
         # tree_frame is packed AFTER the bottom panels so it fills remaining space
 
         self.results_tree = ttk.Treeview(
@@ -2075,9 +2094,8 @@ class ScandocsApp(ttk.Window):
             self.results_tree.column(
                 col, width=width,
                 minwidth=32 if col == "audited" else 50,
-                anchor="center" if col == "audited" else "w",
+                anchor="center" if col in ("audited", "correction") else "w",
             )
-
         self.results_tree.tag_configure("renamed",      background="#d4edda")
         self.results_tree.tag_configure("needs_review", background="#fff3cd")
         self.results_tree.tag_configure("error",        background="#f8d7da")
@@ -2087,7 +2105,16 @@ class ScandocsApp(ttk.Window):
 
         vsb = ttk.Scrollbar(tree_frame, orient="vertical",   command=self.results_tree.yview)
         hsb = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.results_tree.xview)
-        self.results_tree.configure(yscrollcommand=vsb.set, xscrollcommand=hsb.set)
+
+        def _yscroll_set(*args):
+            vsb.set(*args)
+            self._reposition_all_correction_buttons()
+
+        def _xscroll_set(*args):
+            hsb.set(*args)
+            self._reposition_all_correction_buttons()
+
+        self.results_tree.configure(yscrollcommand=_yscroll_set, xscrollcommand=_xscroll_set)
         vsb.pack(side=tk.RIGHT,  fill=tk.Y)
         hsb.pack(side=tk.BOTTOM, fill=tk.X)
         self.results_tree.pack(fill=tk.BOTH, expand=True)
@@ -2096,6 +2123,7 @@ class ScandocsApp(ttk.Window):
         self.results_tree.bind("<Double-Button-1>", self._on_tree_double_click)
         self.results_tree.bind("<Left>",   self._audit_prev)
         self.results_tree.bind("<Right>",  self._audit_next)
+        self.results_tree.bind("<Configure>", lambda e: self._reposition_all_correction_buttons())
         # Mousewheel scroll on the treeview
         _tree_scroll = lambda e: self.results_tree.yview_scroll(
             -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units")
@@ -2227,12 +2255,106 @@ class ScandocsApp(ttk.Window):
         ttk.Label(action_row, textvariable=self.fo_status_var,
                   foreground="gray").pack(side=tk.LEFT, padx=14)
 
-    # ── Tab 2: Manual Entry ───────────────────────────────────
+        # ── Manual Correction panel (hidden until a row's "Manual Correction"
+        #    cell is clicked) ─────────────────────────────────
+        self.correction_panel = ttk.LabelFrame(tab, text="Manual Correction")
+        # Not packed here — _open_manual_correction() shows it, _hide_manual_correction() hides it.
+
+        corr = self.correction_panel
+
+        corr_file_row = ttk.Frame(corr)
+        corr_file_row.pack(fill=tk.X, padx=8, pady=(8, 2))
+        self.corr_file_var = tk.StringVar(value="")
+        ttk.Label(corr_file_row, textvariable=self.corr_file_var,
+                  font=(APP_FONT, 10, "bold")).pack(side=tk.LEFT)
+
+        # Large, unmistakable preview button — spacebar types a space in this
+        # panel's fields instead of toggling the viewer, so this button is the
+        # clear way to see the document while correcting it.
+        ttk.Button(
+            corr, text="🔍  Open File Preview",
+            command=self._corr_open_preview,
+            bootstyle="info", padding=(16, 12),
+        ).pack(fill=tk.X, padx=8, pady=(2, 10))
+
+        corr_fields = ttk.Frame(corr)
+        corr_fields.pack(fill=tk.X, padx=8, pady=(0, 4))
+        corr_fields.columnconfigure(1, weight=1)
+
+        # Row 0: Client typing entry
+        ttk.Label(corr_fields, text="Client:").grid(
+            row=0, column=0, padx=(0, 8), pady=(0, 2), sticky="nw"
+        )
+        self.corr_client_var = tk.StringVar()
+        corr_client_entry = ttk.Entry(
+            corr_fields, textvariable=self.corr_client_var, width=40
+        )
+        corr_client_entry.grid(row=0, column=1, pady=(0, 2), sticky="w")
+        corr_client_entry.bind("<KeyRelease>", self._filter_client_combo)
+        corr_client_entry.bind("<Return>", lambda e: self._corr_next())
+
+        # Row 1: Always-visible scrollable client list — shrinks as user types
+        client_lb_frame = ttk.Frame(corr_fields)
+        client_lb_frame.grid(row=1, column=1, pady=(0, 4), sticky="ew")
+        self.corr_client_listbox = tk.Listbox(
+            client_lb_frame, height=6,
+            font=(APP_FONT, 9),
+            selectmode=tk.SINGLE,
+            exportselection=False,
+            activestyle="none",
+        )
+        cl_lb_vsb = ttk.Scrollbar(client_lb_frame, orient="vertical",
+                                   command=self.corr_client_listbox.yview)
+        self.corr_client_listbox.configure(yscrollcommand=cl_lb_vsb.set)
+        cl_lb_vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.corr_client_listbox.pack(fill=tk.X, expand=True)
+        self.corr_client_listbox.bind(
+            "<<ListboxSelect>>", self._on_client_listbox_select)
+        self.corr_client_listbox.bind(
+            "<Return>", lambda e: self._corr_next())
+
+        # Row 2: Subject
+        ttk.Label(corr_fields, text="Subject:").grid(
+            row=2, column=0, padx=(0, 8), pady=6, sticky="w"
+        )
+        self.corr_subject_var = tk.StringVar()
+        corr_subject_entry = ttk.Entry(
+            corr_fields, textvariable=self.corr_subject_var, width=40)
+        corr_subject_entry.grid(row=2, column=1, pady=6, sticky="w")
+        corr_subject_entry.bind("<Return>", lambda e: self._corr_next())
+
+        # Row 3: Destination folder (shown only when File Mode is on for Manual Correction)
+        self.corr_dest_label = ttk.Label(corr_fields, text="Move to folder:")
+        self.corr_dest_label.grid(row=3, column=0, padx=(0, 8), pady=6, sticky="w")
+        self.corr_dest_label.grid_remove()
+        corr_dest_inner = ttk.Frame(corr_fields)
+        corr_dest_inner.grid(row=3, column=1, pady=6, sticky="ew")
+        corr_dest_inner.grid_remove()
+        ttk.Entry(corr_dest_inner, textvariable=self.fo_dest_var).pack(
+            side=tk.LEFT, padx=(0, 4), fill=tk.X, expand=True)
+        ttk.Button(corr_dest_inner, text="Browse",
+                   command=self._fo_browse_dest,
+                   bootstyle="dark-outline").pack(side=tk.LEFT)
+        self._corr_dest_widgets = [self.corr_dest_label, corr_dest_inner]
+
+        # Row 4: Close / Next buttons
+        corr_btn_row = ttk.Frame(corr)
+        corr_btn_row.pack(fill=tk.X, padx=8, pady=(4, 10))
+        ttk.Button(corr_btn_row, text="Next →",
+                   command=self._corr_next,
+                   bootstyle="primary").pack(side=tk.RIGHT)
+        ttk.Button(corr_btn_row, text="Close",
+                   command=self._corr_close,
+                   bootstyle="dark-outline").pack(side=tk.RIGHT, padx=(0, 6))
+
+    # ── Legacy Manual Entry tab (Settings: "Show Manual Entry tab") ──
+    # Built once at startup but only attached to the notebook (via
+    # _apply_manual_tab_visibility) when the Settings toggle is on.
 
     def _build_review_tab(self):
         tab = ttk.Frame(self.notebook)
         self._review_tab = tab
-        self.notebook.add(tab, text="  Manual Entry  ")
+        self._review_tab_frame = tab
         tk.Frame(tab, bg=_APP_PRIMARY, height=5).pack(fill=tk.X)
 
         top = ttk.Frame(tab)
@@ -2289,7 +2411,7 @@ class ScandocsApp(ttk.Window):
             assign_lf, textvariable=self.review_client_var, width=40
         )
         review_client_entry.grid(row=1, column=1, padx=4, pady=(6, 2), sticky="w")
-        review_client_entry.bind("<KeyRelease>", self._filter_client_combo)
+        review_client_entry.bind("<KeyRelease>", self._filter_review_client_combo)
         review_client_entry.bind("<Return>", lambda e: self._assign_review_file())
 
         # Row 2: Always-visible scrollable client list — shrinks as user types
@@ -2308,7 +2430,7 @@ class ScandocsApp(ttk.Window):
         cl_lb_vsb.pack(side=tk.RIGHT, fill=tk.Y)
         self.review_client_listbox.pack(fill=tk.X, expand=True)
         self.review_client_listbox.bind(
-            "<<ListboxSelect>>", self._on_client_listbox_select)
+            "<<ListboxSelect>>", self._on_review_client_listbox_select)
         self.review_client_listbox.bind(
             "<Return>", lambda e: self._assign_review_file())
 
@@ -2344,7 +2466,7 @@ class ScandocsApp(ttk.Window):
             row=5, column=1, padx=4, pady=(2, 8), sticky="w"
         )
 
-    # ── Tab 3: Client List ────────────────────────────────────
+    # ── Tab 2: Client List ────────────────────────────────────
 
     def _build_clients_tab(self):
         tab = ttk.Frame(self.notebook)
@@ -2408,10 +2530,11 @@ class ScandocsApp(ttk.Window):
         ttk.Label(save_frame, textvariable=self.client_status_var,
                   foreground="green").pack(side=tk.LEFT, padx=10)
 
-    # ── Tab 4: Settings ───────────────────────────────────────
+    # ── Tab 3: Settings ───────────────────────────────────────
 
     def _build_settings_tab(self):
         tab = ttk.Frame(self.notebook)
+        self._settings_tab_frame = tab
         self.notebook.add(tab, text="  Settings  ")
 
         # ── Pinned footer (always visible at the bottom) ──────
@@ -2701,7 +2824,7 @@ class ScandocsApp(ttk.Window):
                 "  Wrong Client Name — Submit Audit will rename it to A-NEEDS REVIEW\n"
                 "  Bad Description — Submit Audit will change the description to 'Scanned Document'\n"
                 "  Failed to Identify Client — tool could not find the client\n"
-                "  Should Have Been Flagged — should have been sent to Manual Entry\n\n"
+                "  Should Have Been Flagged — should have been sent to Manual Correction\n\n"
                 "Click 'Submit Audit' to apply all corrections and save the report."),
             bootstyle="primary-outline",
         )
@@ -2722,8 +2845,8 @@ class ScandocsApp(ttk.Window):
                 "selected tabs.\n\n"
                 "Use 'Apply to Selected' to stage destination folders for one or more "
                 "files, then 'Move Files' to commit all staged moves.\n\n"
-                "You can enable File Mode independently for the Auto-Process tab and "
-                "the Manual Entry tab."),
+                "You can enable File Mode independently for the Process tab and "
+                "the Manual Correction panel."),
             bootstyle="primary-outline",
         )
         _q_file.grid(row=3, column=3, padx=(0, 4), pady=(0, 2), sticky="w")
@@ -2732,18 +2855,26 @@ class ScandocsApp(ttk.Window):
         sub_frame = ttk.Frame(rep_lf)
         sub_frame.grid(row=4, column=0, columnspan=4, sticky="w", padx=28, pady=(0, 8))
         self._fm_auto_chk = ttk.Checkbutton(
-            sub_frame, text="Enable in Auto-Process tab",
+            sub_frame, text="Enable in Process tab",
             variable=self.s_file_mode_auto_var,
             command=self._apply_file_mode,
         )
         self._fm_auto_chk.pack(side=tk.LEFT, padx=(0, 16))
         self._fm_manual_chk = ttk.Checkbutton(
-            sub_frame, text="Enable in Manual Entry tab",
+            sub_frame, text="Enable in Manual Correction panel",
             variable=self.s_file_mode_manual_var,
             command=self._apply_file_mode,
         )
         self._fm_manual_chk.pack(side=tk.LEFT)
         self._file_mode_sub_frame = sub_frame
+
+        ttk.Checkbutton(
+            rep_lf,
+            text="Show Manual Entry tab (legacy) — a separate tab for assigning "
+                 "files without going through Auto-Process",
+            variable=self.s_show_manual_tab_var,
+            command=self._apply_manual_tab_visibility,
+        ).grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
 
         # ── Suggest Location sub-option ───────────────────────────
         self._fm_suggest_frame = ttk.Frame(rep_lf)
@@ -2828,6 +2959,7 @@ class ScandocsApp(ttk.Window):
         self.s_file_mode_var.set(cfg["processing"].get("file_mode", False))
         self.s_file_mode_auto_var.set(cfg["processing"].get("file_mode_auto", True))
         self.s_file_mode_manual_var.set(cfg["processing"].get("file_mode_manual", True))
+        self.s_show_manual_tab_var.set(cfg["processing"].get("show_manual_entry_tab", False))
         self.fo_dest_var.set(cfg["processing"].get("file_mode_destination", ""))
         self.s_suggest_loc_var.set(cfg["processing"].get("suggest_location_enabled", False))
         self.s_suggest_parent_var.set(cfg["processing"].get("suggest_location_parent_folder", ""))
@@ -2845,6 +2977,7 @@ class ScandocsApp(ttk.Window):
         self.after(0, self._apply_extraction_method_ui)
         self.after(0, self._apply_audit_mode)
         self.after(0, self._apply_file_mode)
+        self.after(0, self._apply_manual_tab_visibility)
         self.after(400, self._apply_round_styling)
         # Populate model list in background (won't block startup)
         self.after(300, self._refresh_models)
@@ -2888,6 +3021,7 @@ class ScandocsApp(ttk.Window):
         cfg["processing"]["file_mode"]              = self.s_file_mode_var.get()
         cfg["processing"]["file_mode_auto"]         = self.s_file_mode_auto_var.get()
         cfg["processing"]["file_mode_manual"]       = self.s_file_mode_manual_var.get()
+        cfg["processing"]["show_manual_entry_tab"]  = self.s_show_manual_tab_var.get()
         cfg["processing"]["file_mode_destination"]        = self.fo_dest_var.get().strip()
         cfg["processing"]["suggest_location_enabled"]     = self.s_suggest_loc_var.get()
         cfg["processing"]["suggest_location_parent_folder"] = self.s_suggest_parent_var.get().strip()
@@ -3066,36 +3200,47 @@ class ScandocsApp(ttk.Window):
         except Exception as e:
             messagebox.showerror("Save Failed", str(e))
 
-    # ── Review tab helpers ────────────────────────────────────
+    # ── Manual Correction helpers ──────────────────────────────
 
     def _refresh_review_tab(self):
-        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        """Reload the client-list cache used by the Manual Correction panel's
+        client entry/listbox, and — if the legacy Manual Entry tab is enabled —
+        rescan the scandocs folder for files still awaiting review. Called
+        after processing finishes, after a correction is applied, and after
+        an audit is submitted."""
         client_list_path = self.config_mgr.config["paths"]["client_list_file"]
+        self._all_clients = ClientListManager.load(client_list_path)
+        if hasattr(self, "corr_client_listbox"):
+            self._filter_client_combo()
 
-        self._review_selected_file = ""   # clear stale selection
+        if not hasattr(self, "review_listbox"):
+            return
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        self._review_selected_file = ""
         self.review_listbox.delete(0, tk.END)
         if not os.path.isdir(scandocs):
             self.review_count_var.set("Scandocs folder not found")
-            return
+        else:
+            review_files = sorted(
+                f for f in os.listdir(scandocs)
+                if os.path.isfile(os.path.join(scandocs, f))
+                and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+                and not FileProcessor._already_processed(f, self._all_clients)
+            )
+            for f in review_files:
+                self.review_listbox.insert(tk.END, f)
+            self.review_count_var.set(f"Files awaiting review: {len(review_files)}")
+        self._filter_review_client_combo()
 
-        client_list = ClientListManager.load(client_list_path)
-
-        # Show any file that does not already match the expected
-        # "LAST, First - Subject.ext" format with a recognised client name.
-        review_files = sorted(
-            f for f in os.listdir(scandocs)
-            if os.path.isfile(os.path.join(scandocs, f))
-            and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
-            and not FileProcessor._already_processed(f, client_list)
-        )
-        for f in review_files:
-            self.review_listbox.insert(tk.END, f)
-        self.review_count_var.set(f"Files awaiting review: {len(review_files)}")
-
-        self._all_clients = client_list
-        self.review_client_listbox.delete(0, tk.END)
-        for name in client_list:
-            self.review_client_listbox.insert(tk.END, name)
+    def _apply_manual_tab_visibility(self):
+        """Attach or detach the legacy Manual Entry tab based on the Settings toggle."""
+        show = self.s_show_manual_tab_var.get()
+        present = str(self._review_tab_frame) in self.notebook.tabs()
+        if show and not present:
+            self.notebook.insert(1, self._review_tab_frame, text="  Manual Entry  ")
+            self._refresh_review_tab()
+        elif not show and present:
+            self.notebook.forget(self._review_tab_frame)
 
     def _on_review_select(self, _event):
         sel = self.review_listbox.curselection()
@@ -3188,6 +3333,238 @@ class ScandocsApp(ttk.Window):
         except Exception as e:
             messagebox.showerror("Rename Failed", str(e))
 
+    def _review_prev(self, _event=None):
+        """Move to the previous file in the legacy Manual Entry list."""
+        n = self.review_listbox.size()
+        if n == 0:
+            return
+        sel = self.review_listbox.curselection()
+        idx = (sel[0] - 1) if sel else n - 1
+        idx = max(idx, 0)
+        self.review_listbox.selection_clear(0, tk.END)
+        self.review_listbox.selection_set(idx)
+        self.review_listbox.see(idx)
+        self._on_review_select(None)
+
+    def _review_next(self, _event=None):
+        """Move to the next file in the legacy Manual Entry list."""
+        n = self.review_listbox.size()
+        if n == 0:
+            return
+        sel = self.review_listbox.curselection()
+        idx = (sel[0] + 1) if sel else 0
+        idx = min(idx, n - 1)
+        self.review_listbox.selection_clear(0, tk.END)
+        self.review_listbox.selection_set(idx)
+        self.review_listbox.see(idx)
+        self._on_review_select(None)
+
+    def _on_review_return(self, _event=None):
+        """Spacebar on the legacy Manual Entry list: toggle the file viewer."""
+        sel = self.review_listbox.curselection()
+        filename = (self.review_listbox.get(sel[0]) if sel
+                    else self._review_selected_file)
+        if not filename:
+            return "break"
+        path = os.path.join(
+            self.config_mgr.config["paths"]["scandocs_folder"], filename)
+        if os.path.isfile(path):
+            self._toggle_file_popup(path)
+        return "break"
+
+    def _on_review_double_click(self, _event=None):
+        """Double-click on the legacy Manual Entry list: always open the file viewer."""
+        sel = self.review_listbox.curselection()
+        filename = (self.review_listbox.get(sel[0]) if sel
+                    else self._review_selected_file)
+        if not filename:
+            return "break"
+        path = os.path.join(
+            self.config_mgr.config["paths"]["scandocs_folder"], filename)
+        if os.path.isfile(path):
+            self._open_file_popup(path)
+        return "break"
+
+    def _filter_review_client_combo(self, _event=None):
+        """Filter the legacy Manual Entry tab's client list as the user types."""
+        typed = self.review_client_var.get().lower()
+        self.review_client_listbox.delete(0, tk.END)
+        for name in self._all_clients:
+            if not typed or typed in name.lower():
+                self.review_client_listbox.insert(tk.END, name)
+
+    def _on_review_client_listbox_select(self, _event=None):
+        """Clicking a name in the legacy client list copies it to the entry field."""
+        sel = self.review_client_listbox.curselection()
+        if sel:
+            self.review_client_var.set(self.review_client_listbox.get(sel[0]))
+
+    def _open_manual_correction(self, iid: str):
+        """Show the Manual Correction panel, pre-filled with this row's
+        auto-process result so the employee only has to fix what's wrong."""
+        result = self._iid_to_result.get(iid)
+        if not result:
+            return
+
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        filename = result.final_name
+        if not os.path.isfile(os.path.join(scandocs, filename)):
+            filename = result.original_name
+
+        self._correction_iid = iid
+        self.results_tree.selection_set(iid)
+        self.results_tree.see(iid)
+        self.corr_file_var.set(f"Correcting:  {filename}")
+
+        # Populate with the auto-process info first — if the client/subject
+        # split is already right, the employee only needs to touch the field
+        # that's wrong (often just the file name itself).
+        m = re.match(r"^(.+?) - (.+)\.(pdf|jpg|jpeg)$", filename, re.IGNORECASE)
+        if m:
+            self.corr_client_var.set(m.group(1))
+            self.corr_subject_var.set(m.group(2))
+        else:
+            self.corr_client_var.set(result.client or "")
+            self.corr_subject_var.set(result.description or os.path.splitext(filename)[0])
+
+        self._filter_client_combo()
+
+        if not self.correction_panel.winfo_ismapped():
+            self.correction_panel.pack(fill=tk.X, padx=10, pady=(6, 4),
+                                        after=self._tree_frame)
+            self._grow_window_for_correction_panel()
+
+    def _hide_manual_correction(self):
+        self.correction_panel.pack_forget()
+        self._correction_iid = ""
+        self._shrink_window_after_correction_panel()
+
+    def _grow_window_for_correction_panel(self):
+        """Grow the main window so the newly-shown Manual Correction panel
+        doesn't just squeeze the results table — all its fields stay visible."""
+        if self.state() == "zoomed":
+            return   # already fullscreen; the tree just shrinks to make room
+        self.update_idletasks()
+        panel_h = self.correction_panel.winfo_reqheight()
+        if self._pre_correction_height is None:
+            self._pre_correction_height = self.winfo_height()
+        screen_h = self.winfo_screenheight()
+        new_h = min(self._pre_correction_height + panel_h, screen_h - 60)
+        self.geometry(f"{self.winfo_width()}x{new_h}+{self.winfo_x()}+{self.winfo_y()}")
+
+    def _shrink_window_after_correction_panel(self):
+        """Restore the window to its pre-panel height, if we grew it."""
+        if self._pre_correction_height is None or self.state() == "zoomed":
+            self._pre_correction_height = None
+            return
+        self.geometry(
+            f"{self.winfo_width()}x{self._pre_correction_height}"
+            f"+{self.winfo_x()}+{self.winfo_y()}")
+        self._pre_correction_height = None
+
+    def _corr_open_preview(self):
+        """The Manual Correction panel's big 'Open File Preview' button."""
+        result = self._iid_to_result.get(self._correction_iid)
+        if not result:
+            return
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        path = os.path.join(scandocs, result.final_name)
+        if not os.path.isfile(path):
+            path = os.path.join(scandocs, result.original_name)
+        if os.path.isfile(path):
+            self._open_file_popup(path)
+        else:
+            messagebox.showwarning("File Not Found",
+                f"Could not locate the file:\n{result.final_name}")
+
+    def _corr_commit(self) -> bool:
+        """Apply the Manual Correction panel's fields to the file under
+        correction: rename it (and move it, if Manual File Mode is on).
+        Returns False (and shows a message) if the fields aren't valid yet —
+        callers should not close/advance in that case."""
+        iid = self._correction_iid
+        if not iid or iid not in self._iid_to_result:
+            return True
+        result = self._iid_to_result[iid]
+
+        client  = self.corr_client_var.get().strip()
+        subject = self.corr_subject_var.get().strip()
+        if not client:
+            messagebox.showwarning("Missing Client", "Please select a client from the list.")
+            return False
+        if not subject:
+            messagebox.showwarning("Missing Subject", "Please enter a subject for the document.")
+            return False
+
+        scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        current_name = result.final_name
+        if not os.path.isfile(os.path.join(scandocs, current_name)):
+            current_name = result.original_name
+        if not os.path.isfile(os.path.join(scandocs, current_name)):
+            # File's already gone (moved/renamed outside the app, or by a
+            # prior correction) — nothing to rename. Don't block Close/Next
+            # over it, just leave this row as-is.
+            messagebox.showwarning(
+                "File Not Found",
+                f"Could not locate \"{current_name}\" on disk — "
+                "skipping the rename for this file.")
+            return True
+
+        ext      = os.path.splitext(current_name)[1].lower()
+        safe_sub = FileProcessor._safe_subject(subject) or "Document"
+        new_name = f"{client} - {safe_sub}{ext}"
+
+        if new_name != current_name:
+            new_name = FileProcessor._resolve_collision(scandocs, new_name, current_name)
+            try:
+                os.rename(os.path.join(scandocs, current_name), os.path.join(scandocs, new_name))
+            except Exception as e:
+                messagebox.showwarning(
+                    "Rename Failed",
+                    f"Could not rename the file:\n{e}\n\nMoving on without renaming.")
+                return True
+        else:
+            new_name = current_name
+
+        result.final_name           = new_name
+        result.client               = client
+        result.description          = subject
+        result.status               = "renamed"
+        result.audit_corrected_name = new_name
+
+        vals = list(self.results_tree.item(iid, "values"))
+        vals[2] = new_name   # New Name
+        vals[3] = "OK"       # Status
+        vals[4] = client     # Client
+        self.results_tree.item(iid, values=vals, tags=("renamed",))
+
+        # Optional move, if Manual File Mode has a destination configured
+        if self.s_file_mode_var.get() and self.s_file_mode_manual_var.get():
+            dest = self.fo_dest_var.get().strip()
+            if dest and os.path.isdir(dest):
+                self._fo_do_move(result, dest, iid)
+
+        return True
+
+    def _corr_close(self):
+        """Apply the correction (best-effort) and hide the panel — closing
+        should never be blocked, even if the rename couldn't be applied."""
+        self._corr_commit()
+        self._hide_manual_correction()
+
+    def _corr_next(self):
+        """Apply the correction (best-effort), then open the next row."""
+        self._corr_commit()
+        children = self.results_tree.get_children()
+        if not children or self._correction_iid not in children:
+            self._hide_manual_correction()
+            return
+        idx = children.index(self._correction_iid) + 1
+        if idx >= len(children):
+            self._hide_manual_correction()
+            return
+        self._open_manual_correction(children[idx])
+
     # ── Processing ────────────────────────────────────────────
 
     def _start_processing(self):
@@ -3197,12 +3574,16 @@ class ScandocsApp(ttk.Window):
                 "Configuration Error",
                 "\n".join(errors) + "\n\nPlease fix these in Settings.",
             )
-            self.notebook.select(3)
+            self.notebook.select(self._settings_tab_frame)
             return
 
         # Clear old results
+        self._hide_manual_correction()
         for row in self.results_tree.get_children():
             self.results_tree.delete(row)
+        for btn in self._correction_buttons.values():
+            btn.destroy()
+        self._correction_buttons.clear()
         self._results.clear()
         self._iid_to_result.clear()
         self._total_files = 0
@@ -3539,12 +3920,51 @@ class ScandocsApp(ttk.Window):
                 label,
                 client_cell,
                 "",   # new_location — filled in by _fo_do_move
+                "",   # correction — covered by a real overlaid button, see below
             ),
             tags=(tag,),
         )
         self._iid_to_result[iid] = result
         self._results.append(result)
+        self._make_correction_button(iid)
         self.results_tree.yview_moveto(1.0)
+        self._reposition_all_correction_buttons()
+
+    def _make_correction_button(self, iid: str):
+        """Create the blue 'Manual Correction' button overlaid on this row's
+        correction cell. ttk.Treeview can't style an individual cell, so a
+        real button is placed on top of it instead — see
+        _position_correction_button for how it tracks the row."""
+        btn = tk.Button(
+            self.results_tree,
+            text="✎  Manual Correction",
+            command=lambda i=iid: self._open_manual_correction(i),
+            bg="#1565c0", fg="white",
+            activebackground="#0d47a1", activeforeground="white",
+            disabledforeground="#cfd8dc",
+            relief="solid", bd=1,
+            font=(APP_FONT, 8, "bold"),
+            cursor="hand2",
+        )
+        self._correction_buttons[iid] = btn
+        self._position_correction_button(iid)
+
+    def _position_correction_button(self, iid: str):
+        """Move/show/hide the given row's correction button to track the
+        treeview's current scroll position and column layout."""
+        btn = self._correction_buttons.get(iid)
+        if btn is None or not btn.winfo_exists():
+            return
+        bbox = self.results_tree.bbox(iid, "correction")
+        if not bbox:
+            btn.place_forget()
+            return
+        x, y, w, h = bbox
+        btn.place(x=x + 2, y=y + 2, width=max(w - 4, 10), height=max(h - 4, 10))
+
+    def _reposition_all_correction_buttons(self):
+        for iid in list(self._correction_buttons.keys()):
+            self._position_correction_button(iid)
 
     # ── Audit helpers ─────────────────────────────────────────
 
@@ -3613,13 +4033,21 @@ class ScandocsApp(ttk.Window):
 
         # Suggest Location and Auto-commit are always visible but permanently disabled (Coming Soon)
 
-        # Auto-Process tab — Move Files panel
+        # Process tab — Move Files panel
         if auto_on:
             self.file_ops_panel.pack(fill=tk.X, padx=10, pady=(6, 10))
         else:
             self.file_ops_panel.pack_forget()
 
-        # Manual Entry tab — destination row
+        # Manual Correction panel — destination row
+        if hasattr(self, "_corr_dest_widgets"):
+            for w in self._corr_dest_widgets:
+                if manual_on:
+                    w.grid()
+                else:
+                    w.grid_remove()
+
+        # Legacy Manual Entry tab — destination row
         if hasattr(self, "_review_dest_widgets"):
             for w in self._review_dest_widgets:
                 if manual_on:
@@ -3967,11 +4395,13 @@ class ScandocsApp(ttk.Window):
         if on:
             self.results_tree["displaycolumns"] = (
                 "audited", "original", "new_name", "status", "client",
-                "new_location")
+                "new_location", "correction")
         else:
             self.results_tree["displaycolumns"] = (
                 "original", "new_name", "status", "client",
-                "new_location")
+                "new_location", "correction")
+        if hasattr(self, "_correction_buttons"):
+            self.results_tree.after_idle(self._reposition_all_correction_buttons)
         # Audit panel
         if on:
             self.audit_panel.pack(fill=tk.X, padx=10, pady=(6, 0))
@@ -4082,6 +4512,7 @@ class ScandocsApp(ttk.Window):
                    reverse=self._sort_reverse)
         for i, (_, iid) in enumerate(items):
             self.results_tree.move(iid, "", i)
+        self._reposition_all_correction_buttons()
 
         # Update heading arrows
         arrow = " ↓" if self._sort_reverse else " ↑"
@@ -4302,34 +4733,6 @@ class ScandocsApp(ttk.Window):
         dialog.bind("<Escape>", lambda e: _cancel())
         dialog.wait_window()
 
-    # ── Manual Entry navigation ───────────────────────────────
-
-    def _review_prev(self, _event=None):
-        """Move to the previous file in the Manual Entry list."""
-        n = self.review_listbox.size()
-        if n == 0:
-            return
-        sel = self.review_listbox.curselection()
-        idx = (sel[0] - 1) if sel else n - 1
-        idx = max(idx, 0)
-        self.review_listbox.selection_clear(0, tk.END)
-        self.review_listbox.selection_set(idx)
-        self.review_listbox.see(idx)
-        self._on_review_select(None)
-
-    def _review_next(self, _event=None):
-        """Move to the next file in the Manual Entry list."""
-        n = self.review_listbox.size()
-        if n == 0:
-            return
-        sel = self.review_listbox.curselection()
-        idx = (sel[0] + 1) if sel else 0
-        idx = min(idx, n - 1)
-        self.review_listbox.selection_clear(0, tk.END)
-        self.review_listbox.selection_set(idx)
-        self.review_listbox.see(idx)
-        self._on_review_select(None)
-
     # ── Audit navigation ──────────────────────────────────────
 
     def _audit_prev(self, _event=None):
@@ -4422,9 +4825,43 @@ class ScandocsApp(ttk.Window):
         popup.resizable(True, True)
 
         self.update_idletasks()
-        px = self.winfo_x() + self.winfo_width() + 8
-        py = self.winfo_y()
-        popup.geometry(f"{min(img.width + 20, 900)}x{min(img.height + 40, 860)}+{px}+{py}")
+        screen_w = self.winfo_screenwidth()
+        screen_h = self.winfo_screenheight()
+        ui_cfg = self.config_mgr.config.get("ui", {})
+        saved_w = ui_cfg.get("preview_popup_width")  or 0
+        saved_h = ui_cfg.get("preview_popup_height") or 0
+        if saved_w > 0 and saved_h > 0:
+            width, height = saved_w, saved_h
+        else:
+            # Default: large, centered popup rather than a small side panel
+            width  = int(screen_w * 0.8)
+            height = int(screen_h * 0.85)
+        x = max(0, (screen_w - width) // 2)
+        y = max(0, (screen_h - height) // 2)
+        popup.geometry(f"{width}x{height}+{x}+{y}")
+
+        def _save_popup_size(_event=None):
+            try:
+                w = popup.winfo_width()
+                h = popup.winfo_height()
+            except tk.TclError:
+                return
+            if w <= 1 or h <= 1:
+                return
+            self.config_mgr.config["ui"]["preview_popup_width"]  = w
+            self.config_mgr.config["ui"]["preview_popup_height"] = h
+            self.config_mgr.save()
+
+        self._popup_resize_after_id = None
+
+        def _on_popup_configure(event):
+            if event.widget is not popup:
+                return
+            if self._popup_resize_after_id is not None:
+                popup.after_cancel(self._popup_resize_after_id)
+            self._popup_resize_after_id = popup.after(500, _save_popup_size)
+
+        popup.bind("<Configure>", _on_popup_configure)
 
         canvas = tk.Canvas(popup, bg="white")
         vsb = ttk.Scrollbar(popup, orient="vertical",   command=canvas.yview)
@@ -4446,21 +4883,34 @@ class ScandocsApp(ttk.Window):
         self._file_popup_canvas = canvas
 
         def _on_popup_close():
+            if self._popup_resize_after_id is not None:
+                popup.after_cancel(self._popup_resize_after_id)
+                self._popup_resize_after_id = None
+            _save_popup_size()
             self._file_popup        = None
             self._file_popup_canvas = None
             popup.destroy()
 
         popup.protocol("WM_DELETE_WINDOW", _on_popup_close)
 
-        # Arrow keys while the popup is focused still navigate the list
-        popup.bind("<Left>",  lambda e: (self._audit_prev()   if self.notebook.index("current") == 0
-                                         else self._review_prev()))
-        popup.bind("<Right>", lambda e: (self._audit_next()   if self.notebook.index("current") == 0
-                                         else self._review_next()))
-        popup.bind("<Up>",    lambda e: (self._audit_prev()   if self.notebook.index("current") == 0
-                                         else self._review_prev()))
-        popup.bind("<Down>",  lambda e: (self._audit_next()   if self.notebook.index("current") == 0
-                                         else self._review_next()))
+        # Force keyboard focus onto the popup itself — otherwise, if it was
+        # opened while an Entry field had focus (e.g. from the Manual
+        # Correction panel), spacebar would keep typing into that field
+        # instead of reaching the popup's <space>-to-close binding below.
+        popup.lift()
+        popup.focus_force()
+
+        # Spacebar while the popup is focused closes it, mirroring the
+        # tree/listbox toggle behaviour (the popup steals keyboard focus,
+        # so the tree's own <space> binding never fires while it's open).
+        popup.bind("<space>", lambda e: _on_popup_close())
+
+        # Arrow keys while the popup is focused still navigate the active list
+        # (results tree on the Process tab, or the legacy Manual Entry list).
+        popup.bind("<Left>",  lambda e: self._popup_prev())
+        popup.bind("<Right>", lambda e: self._popup_next())
+        popup.bind("<Up>",    lambda e: self._popup_prev())
+        popup.bind("<Down>",  lambda e: self._popup_next())
 
     def _refresh_popup_content(self, path: str, img=None):
         """Swap the canvas image in the already-open popup for a new file."""
@@ -4488,6 +4938,23 @@ class ScandocsApp(ttk.Window):
         else:
             self._open_file_popup(path)
 
+    def _popup_prev(self):
+        """Arrow-key navigation while the preview popup is focused — routes to
+        whichever list is currently on screen (Process tab or the legacy
+        Manual Entry tab)."""
+        current = self.notebook.select()
+        if current == str(self._process_tab_frame):
+            self._audit_prev()
+        elif current == str(self._review_tab_frame):
+            self._review_prev()
+
+    def _popup_next(self):
+        current = self.notebook.select()
+        if current == str(self._process_tab_frame):
+            self._audit_next()
+        elif current == str(self._review_tab_frame):
+            self._review_next()
+
     def _on_tree_return(self, _event=None):
         """Spacebar on the Auto-Process results tree: toggle the file viewer."""
         sel = self.results_tree.selection()
@@ -4504,19 +4971,6 @@ class ScandocsApp(ttk.Window):
             self._toggle_file_popup(path)
         return "break"   # prevent treeview default Enter behaviour
 
-    def _on_review_return(self, _event=None):
-        """Spacebar on the Manual Entry list: toggle the file viewer."""
-        sel = self.review_listbox.curselection()
-        filename = (self.review_listbox.get(sel[0]) if sel
-                    else self._review_selected_file)
-        if not filename:
-            return "break"
-        path = os.path.join(
-            self.config_mgr.config["paths"]["scandocs_folder"], filename)
-        if os.path.isfile(path):
-            self._toggle_file_popup(path)
-        return "break"
-
     def _on_tree_double_click(self, _event=None):
         """Double-click on the Auto-Process results tree: always open the file viewer."""
         sel = self.results_tree.selection()
@@ -4529,19 +4983,6 @@ class ScandocsApp(ttk.Window):
         path = os.path.join(scandocs, result.final_name)
         if not os.path.isfile(path):
             path = os.path.join(scandocs, result.original_name)
-        if os.path.isfile(path):
-            self._open_file_popup(path)
-        return "break"
-
-    def _on_review_double_click(self, _event=None):
-        """Double-click on the Manual Entry list: always open the file viewer."""
-        sel = self.review_listbox.curselection()
-        filename = (self.review_listbox.get(sel[0]) if sel
-                    else self._review_selected_file)
-        if not filename:
-            return "break"
-        path = os.path.join(
-            self.config_mgr.config["paths"]["scandocs_folder"], filename)
         if os.path.isfile(path):
             self._open_file_popup(path)
         return "break"
@@ -4647,17 +5088,17 @@ class ScandocsApp(ttk.Window):
 
     def _filter_client_combo(self, _event=None):
         """Filter the visible client list as the user types in the entry field."""
-        typed = self.review_client_var.get().lower()
-        self.review_client_listbox.delete(0, tk.END)
+        typed = self.corr_client_var.get().lower()
+        self.corr_client_listbox.delete(0, tk.END)
         for name in self._all_clients:
             if not typed or typed in name.lower():
-                self.review_client_listbox.insert(tk.END, name)
+                self.corr_client_listbox.insert(tk.END, name)
 
     def _on_client_listbox_select(self, _event=None):
         """Clicking a name in the client list copies it to the entry field."""
-        sel = self.review_client_listbox.curselection()
+        sel = self.corr_client_listbox.curselection()
         if sel:
-            self.review_client_var.set(self.review_client_listbox.get(sel[0]))
+            self.corr_client_var.set(self.corr_client_listbox.get(sel[0]))
 
     def _open_report(self):
         folder = self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
@@ -4754,9 +5195,9 @@ class ScandocsApp(ttk.Window):
             "Next steps:\n"
             "1. Go to the Client List tab → add your clients → Save.\n"
             "2. Go to Settings → verify API URLs → Test Connection.\n"
-            "3. Return to Auto-Process → click Auto-Process Documents.",
+            "3. Return to Process → click Auto-Process Documents.",
         )
-        self.notebook.select(3)  # open Settings tab
+        self.notebook.select(self._settings_tab_frame)
 
     # ── Auto-update ───────────────────────────────────────────
 
