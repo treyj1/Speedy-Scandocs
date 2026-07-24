@@ -9,7 +9,15 @@ import glob
 
 import subprocess
 
+from PyInstaller.utils.hooks import collect_data_files
+
 ROOT = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
+
+# ttkbootstrap ships its own runtime assets (icon fonts, theme images) as
+# package data, not code — hiddenimports alone won't bundle these, and
+# newer ttkbootstrap versions (2.x+) load an icon .ttf at style-init time,
+# so a missing file here crashes the app on first launch.
+ttkbootstrap_datas = collect_data_files('ttkbootstrap')
 
 # Find Tesseract — search common locations then fall back to PATH
 _TESS_CANDIDATES = [
@@ -50,7 +58,7 @@ a = Analysis(
         # Client list is intentionally NOT bundled — it's real PII and must
         # never ship in the public installer. The user points Settings at
         # their own client_list.txt at install time.
-    ] + tess_datas,
+    ] + tess_datas + ttkbootstrap_datas,
     hiddenimports=[
         'ttkbootstrap',
         'ttkbootstrap.themes',

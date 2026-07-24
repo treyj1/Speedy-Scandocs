@@ -9,7 +9,15 @@
 
 import os
 
+from PyInstaller.utils.hooks import collect_data_files
+
 ROOT = os.path.abspath(os.path.join(SPECPATH, '..', '..'))
+
+# ttkbootstrap ships its own runtime assets (icon fonts, theme images) as
+# package data, not code — hiddenimports alone won't bundle these, and
+# newer ttkbootstrap versions (2.x+) load an icon .ttf at style-init time,
+# so a missing file here crashes the app on first launch.
+ttkbootstrap_datas = collect_data_files('ttkbootstrap')
 
 # Tesseract paths on the build machine (GitHub Actions macos-13 runner
 # with 'brew install tesseract' already run, or a local Mac with Homebrew)
@@ -56,7 +64,7 @@ a = Analysis(
         # their own client_list.txt at install time.
         (TESS_ENG, 'tessdata'),                 # English language data
         (TESS_OSD, 'tessdata'),                 # Script detection data
-    ],
+    ] + ttkbootstrap_datas,
     hiddenimports=[
         'ttkbootstrap',
         'ttkbootstrap.themes',

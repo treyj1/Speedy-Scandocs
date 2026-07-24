@@ -71,7 +71,7 @@ ASSETS_DIR = os.path.join(SCRIPT_DIR, "assets")
 # APP_VERSION is bumped by build/release.py — keep it in sync with the
 # installer.iss AppVersion. Auto-update checks GitHub Releases on UPDATE_REPO
 # and compares the latest tag (vX.Y.Z) against APP_VERSION.
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 UPDATE_REPO = "treyj1/Speedy-Scandocs"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60   # 24 hours
