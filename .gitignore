@@ -40,3 +40,8 @@ build/windows/Installers/*.exe
 # Windows artifacts
 Thumbs.db
 Desktop.ini
+
+# Benchmark data — REAL CLIENT DOCUMENTS, never commit
+tools/benchmark_data/
+tools/*.csv
+benchmark_results*.csv
