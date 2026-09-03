@@ -256,6 +256,8 @@ DEFAULT_CONFIG: dict = {
     "paths": {
         "scandocs_folder": "",
         "client_list_file": os.path.join(_USER_DATA_DIR, "client_list.txt"),
+        "document_types_file": os.path.join(_USER_DATA_DIR, "document_types.txt"),
+        "providers_file": os.path.join(_USER_DATA_DIR, "providers.txt"),
     },
     "api": {
         "openwebui_url": "http://localhost:3000",
@@ -334,6 +336,20 @@ DEFAULT_CONFIG: dict = {
         "undo_log": True,
         "recheck_before_rename": True,
     },
+    # ── PASS 4: classification quality — vocabularies, structured output,
+    # grounding, evidence-based confidence. Every flag below defaults to
+    # False/off, so an unmodified config reproduces today's exact prompt,
+    # parsing, and confidence behavior. See ClientListManager,
+    # DocumentTypeManager, ProviderManager, APIClient, FileProcessor.
+    "classification": {
+        "structured_output": False,      # off = today's exact prompt and parsing
+        "use_document_types": False,
+        "use_providers": False,
+        "extract_recipient": False,
+        "grounding_check": False,
+        "evidence_confidence": False,
+        "use_candidate_shortlist": False,
+    },
 }
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg"}
@@ -350,6 +366,46 @@ VISION_MODEL_PREFIXES = [
     "gemma4",           # latest, e2b, e4b, 26b, 31b (local variants)
 ]
 VISION_MODEL_EXCLUSIONS = ["-cloud", ":cloud"]
+
+# ── Document type vocabulary (PASS 4) ───────────────────────────────────
+# Seeds document_types.txt on first run when classification.use_document_types
+# is turned on and the file doesn't exist yet. Each entry is written verbatim
+# as a line in "Canonical Name | alias1 | alias2" format — see
+# DocumentTypeManager.load / load_alias_map.
+DEFAULT_DOCUMENT_TYPES = [
+    "Reduction Request | Compromise Offer | Request for Reduction | Reduction Letter",
+    "Balance Verification Request",
+    "PPR | Physician Progress Report | Physicians and Chiropractors Progress Report | "
+    "Physician Chiropractor Progress Report",
+    "Progress Report",
+    "Medical Records Request",
+    "Medical Bills",
+    "Letter of Representation",
+    "Demand Letter",
+    "Lien",
+    "Certified Mail Receipt",
+    "Insurance Claim Payment Check",
+    "Notice of Intention to Close Claim",
+    "Permanent Partial Disability Award Notice",
+    "TTD Benefits Appeal Notice",
+    "Workers Compensation Hearing Appeal",
+    "Retainer Agreement",
+    "Settlement Statement",
+    "Subpoena",
+    "Police Report",
+    "Medical Authorization",
+    "Disability Certification",
+    "IME Report",
+]
+
+# providers.txt ships empty (it fills in from use) — this is only the
+# explanatory comment header written on first run.
+_PROVIDERS_FILE_HEADER = [
+    "# Providers (facilities, clinics, hospitals, insurers, etc.), one per line.",
+    "# This file starts empty and is meant to fill in as recipients/senders are",
+    "# recognized through use. Add a name manually to have it recognized",
+    "# immediately by ProviderManager.normalize.",
+]
 
 
 def _disable_combobox_scroll(widget) -> None:
@@ -1040,6 +1096,208 @@ class ClientListManager:
             f"({len(client_list)} clients)"
         )
         return client_list
+
+
+# ─────────────────────────────────────────────────────────────
+# DocumentTypeManager / ProviderManager (PASS 4)
+# ─────────────────────────────────────────────────────────────
+#
+# Same load/save pattern as ClientListManager: a plain newline-delimited
+# text file, "#" comments and blank lines ignored. Both are inert unless a
+# classification.use_document_types / classification.use_providers flag
+# turns them on — see FileProcessor.process_file.
+
+class DocumentTypeManager:
+
+    @staticmethod
+    def _seed_if_missing(path: str) -> None:
+        """Write DEFAULT_DOCUMENT_TYPES to `path` if nothing is there yet —
+        mirrors how client_list.txt is expected to already exist, except
+        this file is safe to auto-populate since the seed list is generic
+        firm vocabulary, not client data."""
+        if not path or os.path.isfile(path):
+            return
+        try:
+            dirpath = os.path.dirname(path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                f.write("# Document types, one per line.\n")
+                f.write("# Canonical Name | alias1 | alias2 ...\n")
+                f.write("# Lines starting with # are ignored.\n")
+                for line in DEFAULT_DOCUMENT_TYPES:
+                    f.write(line + "\n")
+        except Exception as e:
+            logging.error(f"Could not seed document types file at {path}: {e}")
+
+    @staticmethod
+    def load(path: str) -> list:
+        """Return the canonical document type names (first field of each
+        'Canonical | alias...' line). Seeds the file with
+        DEFAULT_DOCUMENT_TYPES on first run if it doesn't exist yet."""
+        if not path:
+            return []
+        DocumentTypeManager._seed_if_missing(path)
+        if not os.path.isfile(path):
+            return []
+        try:
+            names = []
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    canonical = line.split("|", 1)[0].strip()
+                    if canonical:
+                        names.append(canonical)
+            return names
+        except Exception as e:
+            logging.error(f"Could not load document types from {path}: {e}")
+            return []
+
+    @staticmethod
+    def load_alias_map(path: str) -> dict:
+        """Return {lowercased alias-or-canonical: canonical name} for every
+        name on every line, so 'physician progress report' and 'ppr' both
+        resolve to 'PPR'. Seeds the file on first run, same as load()."""
+        if not path:
+            return {}
+        DocumentTypeManager._seed_if_missing(path)
+        if not os.path.isfile(path):
+            return {}
+        alias_map = {}
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith("#"):
+                        continue
+                    parts = [p.strip() for p in line.split("|") if p.strip()]
+                    if not parts:
+                        continue
+                    canonical = parts[0]
+                    for name in parts:
+                        alias_map[name.lower()] = canonical
+            return alias_map
+        except Exception as e:
+            logging.error(f"Could not load document type aliases from {path}: {e}")
+            return {}
+
+    @staticmethod
+    def save(path: str, canonical_names: list) -> None:
+        """Flat rewrite (no aliases) — for a future editor UI, same shape as
+        ClientListManager.save. Doesn't touch alias data; anything wanting
+        to edit aliases should read/rewrite the file directly."""
+        with open(path, "w", encoding="utf-8") as f:
+            for name in sorted(set(canonical_names)):
+                f.write(name + "\n")
+
+    @staticmethod
+    def normalize(raw: str, alias_map: dict, threshold: float = 0.85) -> str:
+        """Map a raw model-returned doc type string to its canonical name.
+
+        Exact alias/canonical hit first (case-insensitive), then a difflib
+        fuzzy match against every known alias/canonical string. Returns ""
+        when nothing is close enough — the caller should then keep the
+        model's raw printed title rather than discard it."""
+        if not raw or not alias_map:
+            return ""
+        raw_norm = raw.strip().lower()
+        if not raw_norm:
+            return ""
+        if raw_norm in alias_map:
+            return alias_map[raw_norm]
+        best_key = None
+        best_score = 0.0
+        for key in alias_map:
+            score = difflib.SequenceMatcher(None, raw_norm, key).ratio()
+            if score > best_score:
+                best_score = score
+                best_key = key
+        if best_key is not None and best_score >= threshold:
+            return alias_map[best_key]
+        return ""
+
+
+class ProviderManager:
+
+    @staticmethod
+    def _seed_if_missing(path: str) -> None:
+        """Write only the explanatory comment header — providers.txt ships
+        empty and fills in from use, unlike document_types.txt."""
+        if not path or os.path.isfile(path):
+            return
+        try:
+            dirpath = os.path.dirname(path)
+            if dirpath:
+                os.makedirs(dirpath, exist_ok=True)
+            with open(path, "w", encoding="utf-8") as f:
+                for line in _PROVIDERS_FILE_HEADER:
+                    f.write(line + "\n")
+        except Exception as e:
+            logging.error(f"Could not seed providers file at {path}: {e}")
+
+    @staticmethod
+    def load(path: str) -> list:
+        if not path:
+            return []
+        ProviderManager._seed_if_missing(path)
+        if not os.path.isfile(path):
+            return []
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return [
+                    line.strip() for line in f
+                    if line.strip() and not line.startswith("#")
+                ]
+        except Exception as e:
+            logging.error(f"Could not load providers from {path}: {e}")
+            return []
+
+    @staticmethod
+    def save(path: str, providers: list) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            for name in sorted(set(providers)):
+                f.write(name + "\n")
+
+    # Trailing address noise: a comma, or a run of digits, onward — e.g.
+    # "Chiropractic Works, 5105 E. Sahara Ave Ste 144" -> "Chiropractic Works",
+    # "First Care Industrial Medicine 89142" -> "First Care Industrial Medicine".
+    _ADDRESS_NOISE_RE = re.compile(r"(,|\s+\d).*$", re.DOTALL)
+
+    @staticmethod
+    def strip_address(raw: str) -> str:
+        """Strip trailing address noise from a raw recipient/sender string."""
+        if not raw:
+            return raw
+        cleaned = ProviderManager._ADDRESS_NOISE_RE.sub("", raw).strip()
+        return cleaned or raw.strip()
+
+    @staticmethod
+    def normalize(raw: str, providers: list, threshold: float = 0.85) -> str:
+        """Strip address noise from `raw`, then exact/fuzzy match it against
+        `providers`. Returns "" when no known provider is close enough —
+        the caller should keep the raw (address-stripped) value rather than
+        discard it."""
+        if not raw:
+            return ""
+        cleaned = ProviderManager.strip_address(raw)
+        if not providers or not cleaned:
+            return ""
+        cleaned_norm = cleaned.lower()
+        for p in providers:
+            if p.strip().lower() == cleaned_norm:
+                return p
+        best = None
+        best_score = 0.0
+        for p in providers:
+            score = difflib.SequenceMatcher(None, cleaned_norm, p.strip().lower()).ratio()
+            if score > best_score:
+                best_score = score
+                best = p
+        if best is not None and best_score >= threshold:
+            return best
+        return ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1797,11 +2055,51 @@ class DocumentExtractor:
 
 class APIClient:
 
+    # JSON schema handed to Ollama's `format` field (Ollama accepts a
+    # JSON-schema object there, not just the string "json") when
+    # classification.structured_output is on. Keeps malformed responses
+    # rare for the richer shape. The OpenWebUI/OpenAI-compatible path
+    # deliberately does NOT get an equivalent response_format — not every
+    # local gateway accepts that field, so the payload shape there is
+    # unchanged from before this pass.
+    _STRUCTURED_SCHEMA = {
+        "type": "object",
+        "properties": {
+            "client": {"type": "string"},
+            "doc_type": {"type": "string"},
+            "recipient": {"type": "string"},
+            "direction": {"type": "string"},
+            "doc_date": {"type": "string"},
+            "confidence": {"type": "string"},
+        },
+        "required": ["client", "doc_type", "confidence"],
+    }
+
     @staticmethod
-    def _build_prompt(extraction: ExtractionResult) -> str:
-        """Build the classification prompt. AI extracts the client name freely from
-        the document — no client list in the prompt. fuzzy_match (in FileProcessor)
-        maps the raw name to the authoritative list entry."""
+    def _build_prompt(extraction: ExtractionResult, config: Optional[dict] = None,
+                       document_types: Optional[list] = None,
+                       candidates: Optional[list] = None) -> str:
+        """Build the classification prompt.
+
+        With classification.structured_output off (the default, and the
+        behavior when `config` is omitted) this returns the ORIGINAL prompt
+        byte-for-byte — see _build_legacy_prompt. On, it returns a richer
+        prompt asking for doc_type/recipient/direction/doc_date alongside
+        client — see _build_structured_prompt.
+        """
+        cls_cfg = (config or {}).get("classification", {})
+        if not cls_cfg.get("structured_output", False):
+            return APIClient._build_legacy_prompt(extraction)
+        return APIClient._build_structured_prompt(extraction, cls_cfg, document_types, candidates)
+
+    @staticmethod
+    def _build_legacy_prompt(extraction: ExtractionResult) -> str:
+        """The prompt as it existed before PASS 4. Kept verbatim — including
+        the "Incoming Document" escape hatch this pass otherwise removes —
+        so classification.structured_output=False reproduces today's exact
+        behavior. AI extracts the client name freely from the document; no
+        client list in the prompt. fuzzy_match (in FileProcessor) maps the
+        raw name to the authoritative list entry."""
         if extraction.content_type == "text":
             doc_section = f"Document text:\n{extraction.content}"
         else:
@@ -1839,10 +2137,142 @@ class APIClient:
         )
 
     @staticmethod
-    def classify(extraction: ExtractionResult, client_list: list, config: dict) -> dict:
+    def _build_structured_prompt(extraction: ExtractionResult, cls_cfg: dict,
+                                  document_types: Optional[list],
+                                  candidates: Optional[list]) -> str:
+        """Structured-output prompt (classification.structured_output=True).
+
+        Differs from the legacy prompt in four deliberate ways, each fixing
+        a specific production failure:
+          - Prefers the document's own printed title/subject/form name over
+            a paraphrased summary (fixes "Reduction Request" being renamed
+            to a made-up "Compromise Offer Letter Medical Bill").
+          - Removes the "Incoming Document" escape hatch entirely — the
+            model must always attempt a real description.
+          - Optionally includes the firm's document-type vocabulary so the
+            model can return a canonical, collision-resistant type name.
+          - Optionally asks for the recipient/sender organization — the
+            business a business-can't-be-client rule used to train the
+            model away from ever naming, even though the office wants it
+            in filenames like "Reduction Request to Chiropractic Works".
+        """
+        if extraction.content_type == "text":
+            doc_section = f"Document text:\n{extraction.content}"
+        else:
+            doc_section = "[See attached image]"
+
+        lines = [
+            "You are a document classifier for a law firm.",
+            "Your job is to identify which client this document belongs to, "
+            "what kind of document it is, and a few other structured facts "
+            "about it.",
+            "",
+            doc_section,
+            "",
+            "RULES — read carefully before responding:",
+            "",
+            "CLIENT IDENTIFICATION:",
+            "- Scan the document for labels that introduce the client's name, "
+            "in this priority order:",
+            "    1. 'Client:', 'Client Name:', 'Client/Patient Name:'",
+            "    2. 'Claimant:', 'Injured:', 'Injured Party:', 'Injured Worker:'",
+            "    3. 'Patient:', 'Patient Name:'",
+            "    4. 'Insured:', 'Insured Name:', 'Named Insured:'",
+            "    5. 'Employee:' (workers comp)",
+            "    6. 'RE:', 'Re:', 'Regarding:', 'Subject:'",
+            "    7. Case captions (plaintiff or defendant the firm represents)",
+            "- A business, facility, clinic, hospital, insurance company, "
+            "opposing party, or attorney is NEVER the CLIENT. That said, one "
+            "of those IS the expected value for RECIPIENT below — being "
+            "ineligible as the client does not mean ignore it.",
+            "- Return the client's full name exactly as it appears in the document.",
+            "- If you cannot clearly identify the client, return NEEDS_REVIEW.",
+        ]
+
+        if candidates:
+            lines.append("")
+            lines.append(
+                "LIKELY CANDIDATES — the client is probably, but not "
+                "certainly, one of these. Still return NEEDS_REVIEW if none "
+                "of them genuinely fit:"
+            )
+            lines.append(", ".join(candidates))
+
+        lines.append("")
+        lines.append("DOCUMENT TYPE (doc_type):")
+        lines.append(
+            "- Prefer the document's own printed title. If the document "
+            "displays its own title, subject line, or form name (e.g. "
+            "'Reduction Request', \"PHYSICIAN'S AND CHIROPRACTOR'S PROGRESS "
+            "REPORT\"), use that. Do not invent a summary of the contents."
+        )
+        if document_types:
+            lines.append(
+                "- Here is a list of document types this firm commonly "
+                "sees. If the document plainly matches one of them, return "
+                "that exact name. Otherwise, return the document's own "
+                "printed title verbatim:"
+            )
+            lines.append(", ".join(document_types))
+        lines.append(
+            "- Always give your best description of what the document IS, "
+            "even if you cannot identify the client. Never answer "
+            "\"Incoming Document\" or \"Unknown Document\"."
+        )
+
+        lines.append("")
+        lines.append("DIRECTION (direction):")
+        lines.append(
+            "- \"outgoing\" if the document is on the firm's own letterhead "
+            "(\"Law Offices of Greg D. Jensen\" / \"GREG D. JENSEN\"). "
+            "Otherwise \"incoming\"."
+        )
+
+        if cls_cfg.get("extract_recipient", False):
+            lines.append("")
+            lines.append("RECIPIENT (recipient):")
+            lines.append(
+                "- For an outgoing document, give the addressee "
+                "organization — the \"to\" of the letter (e.g. the clinic, "
+                "hospital, or insurer it was sent to)."
+            )
+            lines.append(
+                "- For an incoming document, give the sender organization "
+                "instead."
+            )
+            lines.append(
+                "- This is exactly the kind of business/facility/clinic/"
+                "hospital/insurance-company value that is never a valid "
+                "CLIENT — naming it here is expected and wanted."
+            )
+            lines.append("- Leave it empty if no organization is identifiable.")
+
+        lines.append("")
+        lines.append("DATE (doc_date):")
+        lines.append(
+            "- The date printed on the document itself (letter date, date "
+            "of exam, date of visit) in YYYY-MM-DD format. Leave empty if "
+            "unclear."
+        )
+
+        lines.append("")
+        lines.append("Return ONLY valid JSON with no extra text, in exactly this shape:")
+        lines.append(
+            '{"client": "LAST, First", "doc_type": "Reduction Request", '
+            '"recipient": "Chiropractic Works", "direction": "outgoing", '
+            '"doc_date": "2026-08-10", "confidence": "high|medium|low"}'
+        )
+        return "\n".join(lines)
+
+    @staticmethod
+    def classify(extraction: ExtractionResult, client_list: list, config: dict,
+                 document_types: Optional[list] = None,
+                 candidates: Optional[list] = None) -> dict:
         # No client list in the prompt — AI extracts the name freely from the document.
         # fuzzy_match (called in FileProcessor) maps the raw name to the authoritative list.
-        prompt = APIClient._build_prompt(extraction)
+        cls_cfg = config.get("classification", {})
+        structured = cls_cfg.get("structured_output", False)
+        prompt = APIClient._build_prompt(extraction, config, document_types, candidates)
 
         if config.get("processing", {}).get("debug_log_prompt", False):
             logging.info(f"[DEBUG PROMPT]\n{prompt}\n[END PROMPT]")
@@ -1860,7 +2290,8 @@ class APIClient:
 
         # Fallback: direct Ollama
         try:
-            raw = APIClient._call_ollama(prompt, extraction, api_cfg)
+            schema = APIClient._STRUCTURED_SCHEMA if structured else None
+            raw = APIClient._call_ollama(prompt, extraction, api_cfg, schema=schema)
             return APIClient._parse_response(raw)
         except Exception as e:
             errors.append(f"Ollama: {e}")
@@ -1906,12 +2337,19 @@ class APIClient:
         return resp.json()["choices"][0]["message"]["content"]
 
     @staticmethod
-    def _call_ollama(prompt: str, extraction: ExtractionResult, api_cfg: dict) -> str:
+    def _call_ollama(prompt: str, extraction: ExtractionResult, api_cfg: dict,
+                      schema: Optional[dict] = None) -> str:
         url = api_cfg["ollama_url"].rstrip("/") + "/api/generate"
         payload = {
             "model": api_cfg["model"],
             "prompt": prompt,
-            "format": "json",
+            # Ollama's `format` accepts either the string "json" (loose,
+            # legacy behavior) or a JSON-schema object constraining the
+            # exact shape of the response. Use the schema when the
+            # structured-output prompt is in play so malformed responses
+            # become rare; otherwise keep the legacy "json" behavior
+            # unchanged.
+            "format": schema if schema else "json",
             "stream": False,
         }
         if extraction.content_type == "image":
@@ -1925,25 +2363,88 @@ class APIClient:
         return resp.json().get("response", "")
 
     @staticmethod
+    def _find_balanced_json_object(raw: str) -> Optional[str]:
+        """Find the first balanced {...} substring in `raw`, tracking string
+        literals/escapes so quoted braces don't confuse the depth count.
+
+        Replaces the old `r'\\{[^{}]*\\}'` regex, which only matched a FLAT
+        object — the moment the model's answer contained any nested object
+        (e.g. wrapped as {"result": {...}}, or a stray metadata sub-object)
+        that regex would grab the innermost `{...}` instead of the real
+        answer, or fail outright. This scans forward from the first `{` and
+        returns the substring once bracket depth returns to zero.
+        """
+        start = raw.find("{")
+        if start == -1:
+            return None
+        depth = 0
+        in_string = False
+        escape = False
+        for i in range(start, len(raw)):
+            ch = raw[i]
+            if in_string:
+                if escape:
+                    escape = False
+                elif ch == "\\":
+                    escape = True
+                elif ch == '"':
+                    in_string = False
+                continue
+            if ch == '"':
+                in_string = True
+            elif ch == "{":
+                depth += 1
+            elif ch == "}":
+                depth -= 1
+                if depth == 0:
+                    return raw[start:i + 1]
+        return None
+
+    @staticmethod
     def _parse_response(raw: str) -> dict:
-        # Try direct parse
+        """Parse the model's raw answer into a dict. Handles both the
+        legacy {client, desc, confidence} shape and the structured
+        {client, doc_type, recipient, direction, doc_date, confidence}
+        shape — callers use .get() with defaults either way.
+
+        Three attempts, in order:
+          1. The whole response is valid JSON.
+          2. A balanced {...} substring somewhere inside it (handles prose
+             wrapping the JSON, and — unlike the old flat regex — a
+             genuinely nested object inside the answer).
+          3. Give up.
+
+        On failure (3), the returned dict carries `_parse_failed: True` so
+        callers can tell "we couldn't read the model's answer" apart from
+        "the model said it doesn't know" (raw_client == NEEDS_REVIEW). The
+        raw response is logged at WARNING either way.
+        """
+        # 1. direct parse
         try:
             data = json.loads(raw)
             if isinstance(data, dict) and "client" in data:
                 return data
         except json.JSONDecodeError:
             pass
-        # Extract first JSON object via regex
-        match = re.search(r'\{[^{}]*\}', raw, re.DOTALL)
-        if match:
+
+        # 2. balanced-brace scan
+        candidate = APIClient._find_balanced_json_object(raw)
+        if candidate:
             try:
-                data = json.loads(match.group())
+                data = json.loads(candidate)
                 if isinstance(data, dict):
                     return data
             except json.JSONDecodeError:
                 pass
+
+        # 3. give up
         logging.warning(f"Could not parse API response as JSON. Raw: {raw[:300]}")
-        return {"client": "A-NEEDS REVIEW", "desc": "Unknown Document", "confidence": "low"}
+        return {
+            "client": "A-NEEDS REVIEW",
+            "desc": "Unknown Document",
+            "confidence": "low",
+            "_parse_failed": True,
+        }
 
     @staticmethod
     def test_connection(config: dict) -> tuple:
@@ -2112,12 +2613,53 @@ class FileProcessor:
                     and extraction.content_type == "text" and extraction.content:
                 identifiers = DocumentExtractor.extract_identifiers(extraction.content)
 
+            # ── PASS 4 classification vocabularies (all off by default) ──
+            cls_cfg = config.get("classification", {})
+            paths_cfg = config.get("paths", {})
+
+            document_types_for_prompt = None
+            doc_type_alias_map: dict = {}
+            if cls_cfg.get("use_document_types", False):
+                doc_types_path = paths_cfg.get("document_types_file", "")
+                document_types_for_prompt = DocumentTypeManager.load(doc_types_path)
+                doc_type_alias_map = DocumentTypeManager.load_alias_map(doc_types_path)
+
+            providers_list: list = []
+            if cls_cfg.get("use_providers", False):
+                providers_list = ProviderManager.load(paths_cfg.get("providers_file", ""))
+
+            # Dead-code cleanup (PASS 4 item 6): ClientListManager.filter_candidates
+            # existed but was never called. Wired in here behind its own flag —
+            # only offered to the prompt when it actually narrowed the list
+            # (its own fallback is the unfiltered full list, which isn't a
+            # useful "candidates" hint).
+            candidates_for_prompt = None
+            if cls_cfg.get("use_candidate_shortlist", False) \
+                    and extraction.content_type == "text" and extraction.content:
+                shortlist_size = proc_cfg.get("candidate_list_size", 10)
+                shortlist = ClientListManager.filter_candidates(
+                    extraction.content, client_list, top_n=shortlist_size
+                )
+                if len(shortlist) < len(client_list):
+                    candidates_for_prompt = shortlist
+
             # Classify via AI
-            result = APIClient.classify(extraction, client_list, config)
+            result = APIClient.classify(
+                extraction, client_list, config,
+                document_types=document_types_for_prompt,
+                candidates=candidates_for_prompt,
+            )
             raw_client = result.get("client", "NEEDS_REVIEW").strip().strip("\"'")
             raw_desc = result.get("desc", "Unknown Document")
+            raw_doc_type = (result.get("doc_type") or "").strip()
+            raw_recipient = (result.get("recipient") or "").strip()
+            direction = (result.get("direction") or "").strip().lower()
+            if direction not in ("incoming", "outgoing"):
+                direction = ""
+            raw_doc_date = (result.get("doc_date") or "").strip()
             confidence = result.get("confidence", "low")
             raw_confidence = confidence
+            parse_failed = bool(result.get("_parse_failed", False))
 
             # First 2000 chars of the actual extracted text, for later
             # learning/dedupe features. Vision mode reads images, not text,
@@ -2130,6 +2672,60 @@ class FileProcessor:
 
             # Log what the AI returned so failures are easy to diagnose
             logging.info(f"{filename}: AI returned client='{raw_client}' confidence={confidence}")
+
+            # ── Grounding self-check (classification.grounding_check) ──
+            # Text extractions only — vision mode never produced OCR text to
+            # check against. Also feeds evidence_confidence's rubric below,
+            # so it runs whenever either flag wants it, but only FORCES a
+            # confidence downgrade when grounding_check itself is on.
+            grounded = True
+            grounding_evaluated = False
+            if extraction.content_type == "text" and extraction.content \
+                    and raw_client not in ("NEEDS_REVIEW", "A-NEEDS REVIEW", "") \
+                    and (cls_cfg.get("grounding_check", False)
+                         or cls_cfg.get("evidence_confidence", False)):
+                grounded = FileProcessor._grounding_check(raw_client, extraction.content)
+                grounding_evaluated = True
+                if not grounded and cls_cfg.get("grounding_check", False):
+                    logging.warning(
+                        f"{filename}: model returned client '{raw_client}' but "
+                        "that name does not appear in the document — "
+                        "downgrading confidence"
+                    )
+                    confidence = "low"
+
+            # ── Document type normalization (classification.use_document_types) ──
+            # Keeps the model's raw printed title when nothing in the
+            # vocabulary is close enough — never discards it.
+            doc_type_matched = False
+            final_doc_type = raw_doc_type
+            if cls_cfg.get("use_document_types", False) and raw_doc_type:
+                normalized_type = DocumentTypeManager.normalize(raw_doc_type, doc_type_alias_map)
+                if normalized_type:
+                    final_doc_type = normalized_type
+                    doc_type_matched = True
+
+            # ── Recipient normalization (classification.use_providers) ──
+            final_recipient = raw_recipient
+            if cls_cfg.get("use_providers", False) and raw_recipient:
+                normalized_recipient = ProviderManager.normalize(raw_recipient, providers_list)
+                if normalized_recipient:
+                    final_recipient = normalized_recipient
+                else:
+                    final_recipient = ProviderManager.strip_address(raw_recipient)
+
+            # ── Evidence-based confidence (classification.evidence_confidence) ──
+            # Overrides the model's self-reported confidence with a score
+            # computed from independently-checkable signals. See
+            # _compute_confidence's docstring for the rubric.
+            if cls_cfg.get("evidence_confidence", False):
+                confidence = FileProcessor._compute_confidence(
+                    raw_client, extraction, client_list,
+                    doc_type_matched=doc_type_matched,
+                    grounded=grounded,
+                    grounding_evaluated=grounding_evaluated,
+                    parse_failed=parse_failed,
+                )
 
             # Confidence gate — configurable in Settings.
             # require_high_confidence=True (default): only "high" proceeds to rename.
@@ -2165,7 +2761,15 @@ class FileProcessor:
                 final_client = "A-NEEDS REVIEW"
                 status = "needs_review"
 
-            safe_desc = FileProcessor._safe_subject(raw_desc) or "Document"
+            # Naming templates are a later pass (PASS 5) — filename construction
+            # itself (final_client + " - " + safe_desc) is unchanged here. The
+            # only PASS 4 change is which text feeds safe_desc: the model's own
+            # printed doc_type when structured_output is on, the free-form desc
+            # otherwise (today's exact behavior).
+            if cls_cfg.get("structured_output", False) and final_doc_type:
+                safe_desc = FileProcessor._safe_subject(final_doc_type) or "Document"
+            else:
+                safe_desc = FileProcessor._safe_subject(raw_desc) or "Document"
 
             # Safety net: if the description is still fax-related despite the prompt rule,
             # substitute a neutral fallback rather than letting it become the filename.
@@ -2241,13 +2845,17 @@ class FileProcessor:
                 extracted_text=extracted_text,
                 doc_hash=doc_hash,
                 claim_number=identifiers.get("claim_number", ""),
-                # doc_date: nothing else in this pass sets it, so date_of_injury
-                # is the only candidate here — but it's a fallback, not the
-                # primary source. A later pass should set doc_date from the
-                # document's own letterhead/signature date when available and
-                # only fall back to DOI when that's genuinely all there is,
-                # since a document is often dated well after the injury.
-                doc_date=identifiers.get("date_of_injury", ""),
+                # doc_date: prefer the date the model read directly off the
+                # document itself (letterhead/signature date, exam/visit
+                # date — only populated when classification.structured_output
+                # is on) and fall back to date_of_injury only when the model
+                # didn't return one, since a document is often dated well
+                # after the injury. This is the "later pass" PASS 3 left a
+                # comment for.
+                doc_date=raw_doc_date or identifiers.get("date_of_injury", ""),
+                doc_type=final_doc_type,
+                recipient=final_recipient,
+                direction=direction,
                 was_dry_run=dry_run,
             )
 
@@ -2270,6 +2878,137 @@ class FileProcessor:
     def _desc_is_fax(desc: str) -> bool:
         lower = desc.lower()
         return any(p in lower for p in FileProcessor._FAX_DESC_PATTERNS)
+
+    # ── Grounding self-check (classification.grounding_check) ──────────────
+
+    @staticmethod
+    def _grounding_check(client_name: str, text: str) -> bool:
+        """For text extractions only: verify a model-returned client name is
+        actually present in the extracted document text, catching
+        hallucinated names cheaply.
+
+        Compares the normalized surname against the normalized document
+        text two ways:
+          1. Plain containment — fast path, covers the vast majority of
+             real documents.
+          2. A difflib ratio over a sliding window the width of the
+             surname, to tolerate OCR noise (a dropped or substituted
+             letter) that would defeat plain containment.
+
+        Returns True when there's nothing meaningful to check (empty name,
+        empty text, or a surname too short to check reliably) so a caller
+        never downgrades a document there was no way to verify.
+        """
+        if not client_name or not text:
+            return True
+        name = client_name.strip()
+        surname = name.split(",")[0].strip() if "," in name else (name.split() or [name])[-1]
+        surname_norm = re.sub(r"[^a-z]", "", surname.lower())
+        if len(surname_norm) < 3:
+            return True
+
+        text_norm = re.sub(r"[^a-z]", "", text.lower())
+        if not text_norm:
+            return True
+
+        # 1. plain containment
+        if surname_norm in text_norm:
+            return True
+
+        # 2. sliding-window difflib ratio, to tolerate OCR noise
+        window = len(surname_norm)
+        step = max(1, window // 2)
+        best = 0.0
+        for i in range(0, max(1, len(text_norm) - window + 1), step):
+            chunk = text_norm[i:i + window]
+            score = difflib.SequenceMatcher(None, surname_norm, chunk).ratio()
+            if score > best:
+                best = score
+                if best >= 0.9:
+                    break
+        return best >= 0.82
+
+    # ── Evidence-based confidence (classification.evidence_confidence) ─────
+
+    @staticmethod
+    def _compute_confidence(raw_client: str, extraction: "ExtractionResult",
+                             client_list: list, doc_type_matched: bool,
+                             grounded: bool, grounding_evaluated: bool,
+                             parse_failed: bool) -> str:
+        """Compute a confidence level from independently-checkable evidence
+        instead of trusting the model's own self-reported confidence field.
+
+        Rubric — each signal nudges a running score, then the score is
+        bucketed into high/medium/low:
+
+            +2 strong     the client name was found under a recognized
+                          label (DocumentExtractor._extract_labeled_snippets
+                          returns a snippet that overlaps the returned name)
+            +2 strong     fuzzy match score against the client list >= 0.95
+            +1 moderate   doc_type matched a known canonical type
+            +1 moderate   the grounding check ran and passed
+            -3 strong     response parsing failed (APIClient._parse_response
+                          had to fall back — `_parse_failed`)
+            -3 strong     the grounding check ran and failed
+            -2 strong     extraction text quality (assess_text_quality) is
+                          below 0.35 — the OCR itself looked unreliable
+
+            score >= 3  -> "high"
+            score >= 1  -> "medium"
+            otherwise   -> "low"
+
+        `grounding_evaluated` distinguishes "the check ran and passed" from
+        "the check never ran" (vision mode, empty client, or both grounding
+        flags off) — the latter is neutral, not evidence of anything, so it
+        contributes neither the + nor the - grounding signal.
+
+        Vision extractions (no OCR text) skip the text-dependent signals
+        (labeled snippet, text quality) but still get the fuzzy-match,
+        doc_type, and parse-failure signals.
+
+        Only called when classification.evidence_confidence is on; the
+        model's self-reported confidence is used unchanged otherwise.
+        """
+        score = 0.0
+        text = extraction.content if extraction.content_type == "text" else ""
+
+        if text and raw_client:
+            client_last = raw_client.split(",")[0].strip().lower()
+            for snippet in DocumentExtractor._extract_labeled_snippets(text):
+                snippet_lower = snippet.lower()
+                if client_last and (client_last in snippet_lower or snippet_lower in raw_client.lower()):
+                    score += 2
+                    break
+
+        if raw_client and client_list:
+            candidate_norm = ClientListManager._normalize(raw_client)
+            best = 0.0
+            for entry in client_list:
+                r = difflib.SequenceMatcher(None, candidate_norm, ClientListManager._normalize(entry)).ratio()
+                if r > best:
+                    best = r
+            if best >= 0.95:
+                score += 2
+
+        if doc_type_matched:
+            score += 1
+
+        if grounding_evaluated:
+            if grounded:
+                score += 1
+            else:
+                score -= 3
+
+        if parse_failed:
+            score -= 3
+        if text and DocumentExtractor.assess_text_quality(text) < 0.35:
+            score -= 2
+
+        if score >= 3:
+            return "high"
+        if score >= 1:
+            return "medium"
+        return "low"
 
     # Small joining words that stay lowercase when they aren't the first
     # token of the subject (e.g. "Reduction Request to Chiropractic Works").
