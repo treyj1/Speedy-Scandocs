@@ -421,6 +421,74 @@ def test_document_type_normalize():
         shutil.rmtree(tmp)
 
 
+def test_document_type_save_preserves_aliases():
+    section("DocumentTypeManager.save — aliases survive a rewrite")
+    # Regression: save() was a flat rewrite of canonical names only, so the
+    # first press of the Document Types tab's Save button — or the first
+    # accepted doc-type suggestion — silently destroyed every alias in the
+    # file. normalize() matches against those aliases, so "Compromise Offer"
+    # stopped resolving to "Reduction Request" with no error, no log line,
+    # and the same names still listed in the tab.
+    DTM = sd.DocumentTypeManager
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "document_types.txt")
+        before = DTM.load_alias_map(path)              # seeds the file
+        check("seed file carries more aliases than canonical names",
+              len(before) > len(DTM.load(path)), True)
+
+        # Exactly what the Save button and Accept-suggestion both do.
+        names = DTM.load(path)
+        names.append("New Type From Suggestion")
+        DTM.save(path, names)
+
+        after = DTM.load_alias_map(path)
+        check("alias count is preserved (plus the new canonical)",
+              len(after), len(before) + 1)
+        check("an alias still resolves after saving",
+              DTM.normalize("Compromise Offer", after), "Reduction Request")
+        check("the padded-title containment pass still works",
+              DTM.normalize("Compromise Offer Letter Medical Bill", after),
+              "Reduction Request")
+        check("the new type is present", "New Type From Suggestion" in DTM.load(path), True)
+        check("the comment header survives",
+              open(path, encoding="utf-8").read().startswith("#"), True)
+
+        # Removing a type takes its aliases with it — an alias cannot
+        # outlive the canonical it points at — and leaves the rest alone.
+        names = [n for n in DTM.load(path) if n != "Reduction Request"]
+        DTM.save(path, names)
+        after_removal = DTM.load_alias_map(path)
+        check("a removed type is gone", "Reduction Request" in DTM.load(path), False)
+        check("its aliases went with it",
+              DTM.normalize("Compromise Offer", after_removal), "")
+        check("an unrelated type keeps its aliases",
+              DTM.normalize("Physician Progress Report", after_removal), "PPR")
+    finally:
+        shutil.rmtree(tmp)
+
+
+def test_provider_save_preserves_header():
+    section("ProviderManager.save — header survives a rewrite")
+    PM = sd.ProviderManager
+    tmp = tempfile.mkdtemp()
+    try:
+        path = os.path.join(tmp, "providers.txt")
+        PM.load(path)                                   # seeds the header
+        PM.save(path, ["Chiropractic Works", "First Care"])
+        check("the comment header survives",
+              open(path, encoding="utf-8").read().startswith("#"), True)
+        check("entries round-trip",
+              PM.load(path), ["Chiropractic Works", "First Care"])
+        # An indented comment is a comment, not a provider name.
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("   # indented note\n")
+        check("an indented comment is not read as a provider",
+              PM.load(path), ["Chiropractic Works", "First Care"])
+    finally:
+        shutil.rmtree(tmp)
+
+
 # ─────────────────────────────────────────────────────────────
 # Config
 # ─────────────────────────────────────────────────────────────
@@ -698,6 +766,8 @@ def main():
         test_learning_store_scan_cap,
         test_learning_store_trim,
         test_document_type_normalize,
+        test_document_type_save_preserves_aliases,
+        test_provider_save_preserves_header,
         test_config_merge,
         test_settings_dependencies,
         test_mode_round_trip,

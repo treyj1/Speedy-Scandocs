@@ -1314,13 +1314,74 @@ class DocumentTypeManager:
             return {}
 
     @staticmethod
+    def _split_file(path: str) -> tuple:
+        """Read `path` into (header_comment_lines, {canonical: whole line}).
+
+        The returned line is kept VERBATIM — aliases, spacing and all — so
+        save() can write an untouched entry back exactly as the user wrote
+        it. Missing/unreadable file yields ([], {})."""
+        header: List[str] = []
+        entries: dict = {}
+        if not path or not os.path.isfile(path):
+            return header, entries
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                seen_entry = False
+                for raw in f:
+                    line = raw.rstrip("\n")
+                    stripped = line.strip()
+                    if not stripped or stripped.startswith("#"):
+                        # Only the comment block ABOVE the first entry is a
+                        # header; comments further down belong to whatever
+                        # the user was annotating and are dropped on rewrite.
+                        if not seen_entry:
+                            header.append(line)
+                        continue
+                    seen_entry = True
+                    canonical = stripped.split("|", 1)[0].strip()
+                    if canonical:
+                        entries[canonical] = stripped
+        except Exception as e:
+            logging.error(f"Could not read document types from {path}: {e}")
+            return [], {}
+        return header, entries
+
+    @staticmethod
     def save(path: str, canonical_names: list) -> None:
-        """Flat rewrite (no aliases) — for a future editor UI, same shape as
-        ClientListManager.save. Doesn't touch alias data; anything wanting
-        to edit aliases should read/rewrite the file directly."""
-        with open(path, "w", encoding="utf-8") as f:
+        """Rewrite the file with exactly `canonical_names`, PRESERVING each
+        surviving entry's aliases and the explanatory comment header.
+
+        This used to be a flat rewrite of canonical names only, which
+        silently destroyed every alias in the file — so the first press of
+        the Document Types tab's Save button, or the first accepted
+        doc-type suggestion, wiped the vocabulary that
+        DocumentTypeManager.normalize matches against ("Compromise Offer"
+        stopped resolving to "Reduction Request"). Nothing surfaced the
+        loss: no error, no log line, and the tab still listed the same
+        canonical names — only naming quality quietly degraded.
+
+        A name dropped from `canonical_names` takes its aliases with it:
+        the file format is "Canonical | alias | alias", so an alias cannot
+        outlive the canonical it points at.
+        """
+        header, existing = DocumentTypeManager._split_file(path)
+        if not header:
+            header = [
+                "# Document types, one per line.",
+                "# Canonical Name | alias1 | alias2 ...",
+                "# Lines starting with # are ignored.",
+            ]
+        dirpath = os.path.dirname(path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for line in header:
+                f.write(line + "\n")
             for name in sorted(set(canonical_names)):
-                f.write(name + "\n")
+                # Write the original line (aliases intact) when we have one.
+                f.write(existing.get(name.strip(), name.strip()) + "\n")
+        os.replace(tmp, path)
 
     @staticmethod
     def normalize(raw: str, alias_map: dict, threshold: float = 0.85) -> str:
@@ -1393,9 +1454,12 @@ class ProviderManager:
             return []
         try:
             with open(path, "r", encoding="utf-8") as f:
+                # Test the STRIPPED line for the comment marker — an
+                # indented "  # note" is a comment too, not a provider named
+                # "# note".
                 return [
                     line.strip() for line in f
-                    if line.strip() and not line.startswith("#")
+                    if line.strip() and not line.strip().startswith("#")
                 ]
         except Exception as e:
             logging.error(f"Could not load providers from {path}: {e}")
@@ -1403,9 +1467,38 @@ class ProviderManager:
 
     @staticmethod
     def save(path: str, providers: list) -> None:
-        with open(path, "w", encoding="utf-8") as f:
+        """Rewrite the provider list, keeping the explanatory comment
+        header. providers.txt has no aliases, so unlike
+        DocumentTypeManager.save there is nothing else to preserve — but a
+        flat rewrite still threw the header away, leaving a user who opened
+        the file with no idea what it was for."""
+        header: List[str] = []
+        if path and os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    for raw in f:
+                        line = raw.rstrip("\n")
+                        stripped = line.strip()
+                        if not stripped:
+                            continue
+                        if not stripped.startswith("#"):
+                            break   # reached the first real entry
+                        header.append(line)
+            except Exception as e:
+                logging.warning(f"Could not read providers header from {path}: {e}")
+                header = []
+        if not header:
+            header = list(_PROVIDERS_FILE_HEADER)
+        dirpath = os.path.dirname(path)
+        if dirpath:
+            os.makedirs(dirpath, exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            for line in header:
+                f.write(line + "\n")
             for name in sorted(set(providers)):
-                f.write(name + "\n")
+                f.write(name.strip() + "\n")
+        os.replace(tmp, path)
 
     # Trailing address noise: a comma, or a run of digits, onward — e.g.
     # "Chiropractic Works, 5105 E. Sahara Ave Ste 144" -> "Chiropractic Works",
@@ -5904,8 +5997,8 @@ class ScandocsApp(ttk.Window):
         name = self.doc_type_listbox.get(sel[0])
         if messagebox.askyesno(
             "Remove", f'Remove "{name}" from the list?\n\n'
-            "This only removes the canonical name shown here — if it had aliases in "
-            "document_types.txt, edit the file directly to remove those too.",
+            "Any alternate wordings recorded for it are removed as well. "
+            "Every other document type keeps its alternate wordings.",
         ):
             self.doc_type_listbox.delete(sel[0])
             self.doc_type_status_var.set("Unsaved changes")
