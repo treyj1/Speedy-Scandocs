@@ -17,6 +17,7 @@ import sys
 import json
 import base64
 import difflib
+import hashlib
 import logging
 import threading
 import queue
@@ -76,6 +77,16 @@ UPDATE_REPO = "treyj1/Speedy-Scandocs"
 UPDATE_API_URL = f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest"
 UPDATE_CHECK_INTERVAL_SEC = 24 * 60 * 60   # 24 hours
 
+# ── Build flavor ────────────────────────────────────────────────────────────
+# "production" or "test". A test build uses a separate app-data directory
+# (so it never touches a real installation's config/logs/reports/client
+# list) and disables auto-update entirely. Do not change this by editing the
+# installer/spec files in this pass — it's a source-level switch for now.
+BUILD_FLAVOR = "production"   # "production" or "test"
+IS_TEST_BUILD = (BUILD_FLAVOR == "test")
+APP_TITLE = "Speedy Scandocs" + (" [TEST BUILD]" if IS_TEST_BUILD else "")
+_APP_DATA_DIRNAME = "SpeedyScandocs-Test" if IS_TEST_BUILD else "SpeedyScandocs"
+
 # ── Colour-palette definitions ─────────────────────────────────────────────
 # App primary color — fixed, no user-selectable palette
 _APP_PRIMARY   = "#1565c0"
@@ -96,7 +107,7 @@ if getattr(sys, "frozen", False):
         _appdata = os.path.join(os.path.expanduser("~"), "Library", "Application Support")
     else:
         _appdata = os.environ.get("XDG_DATA_HOME", os.path.join(os.path.expanduser("~"), ".local", "share"))
-    _USER_DATA_DIR = os.path.join(_appdata, "SpeedyScandocs")
+    _USER_DATA_DIR = os.path.join(_appdata, _APP_DATA_DIRNAME)
     os.makedirs(_USER_DATA_DIR, exist_ok=True)
 else:
     _USER_DATA_DIR = SCRIPT_DIR
@@ -262,6 +273,43 @@ DEFAULT_CONFIG: dict = {
         "preview_popup_width": 0,   # 0 = not yet set by the user; use the default large size
         "preview_popup_height": 0,
     },
+    # ── Foundation for later passes — all defaults below reproduce today's
+    # behavior exactly. No UI wired to these yet.
+    "naming": {
+        "preserve_acronyms": True,          # safe, pure improvement — on by default
+        "include_recipient": False,
+        "include_doc_date": False,
+        "templates": {},                    # doc_type -> template string, filled later
+        "default_template": "{client} - {doc_type}",
+        "date_disambiguation": False,       # False = legacy "(1)" behavior
+        "unknown_client_label": "A-UNKNOWN CLIENT",
+        "no_client_label": "A-NEEDS REVIEW",   # keep legacy default
+    },
+    "reading": {
+        "skip_fax_cover_pages": False,
+        "deskew_photos": False,
+        "vision_escalation": False,
+        "extract_claim_numbers": False,
+    },
+    "learning": {
+        "log_corrections": True,            # foundation; harmless, just writes a log
+        "document_types": "off",            # "off" | "suggest" | "auto"
+        "client_relationships": "off",      # "off" | "suggest" | "auto"
+        "claim_linking": "off",             # "off" | "suggest" | "auto"
+        "observations_required": 3,
+        "retroactive_rename": "off",        # "off" | "preview"
+    },
+    "automation": {
+        "dry_run": False,
+        "watch_folder": False,
+        "watch_poll_seconds": 15,
+    },
+    "safety": {
+        # Deliberately NOT user-toggleable. Present for diagnostics/logging only.
+        "instance_lock": True,
+        "undo_log": True,
+        "recheck_before_rename": True,
+    },
 }
 
 SUPPORTED_EXTENSIONS = {".pdf", ".jpg", ".jpeg"}
@@ -336,6 +384,18 @@ class ProcessResult:
     # File mode
     moved_to: str = ""              # destination path after a successful move
     pending_dest: str = ""          # destination staged via "Apply to Selected", not yet moved
+    # Foundation fields for later passes (learning, structured naming, etc.)
+    raw_client: str = ""            # what the model returned, before fuzzy matching
+    raw_confidence: str = ""
+    extracted_text: str = ""        # first 2000 chars of what was actually read
+    doc_hash: str = ""              # sha256 of file bytes, for dedupe
+    doc_type: str = ""              # structured field, populated in a later pass
+    recipient: str = ""
+    doc_date: str = ""
+    direction: str = ""             # "incoming" | "outgoing" | ""
+    claim_number: str = ""
+    was_dry_run: bool = False
+    skip_reason: str = ""           # why a file was skipped, for reporting
 
 
 # ─────────────────────────────────────────────────────────────
@@ -353,17 +413,36 @@ class ConfigManager:
         try:
             with open(CONFIG_PATH, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            merged = self._deep_copy(DEFAULT_CONFIG)
-            merged["paths"].update(data.get("paths", {}))
-            merged["api"].update(data.get("api", {}))
-            merged["processing"].update(data.get("processing", {}))
-            merged["reports"].update(data.get("reports", {}))
-            merged["updates"].update(data.get("updates", {}))
-            merged["ui"].update(data.get("ui", {}))
-            return merged
+            return self._deep_merge(self._deep_copy(DEFAULT_CONFIG), data)
         except Exception as e:
             logging.warning(f"Could not load config.json: {e}. Using defaults.")
             return self._deep_copy(DEFAULT_CONFIG)
+
+    @staticmethod
+    def _deep_merge(defaults: dict, saved: dict) -> dict:
+        """Recursively merge `saved` (loaded from disk) over `defaults`.
+
+        - A saved scalar overrides the default.
+        - A key present in defaults but missing from saved keeps the default.
+        - A key present in saved but unknown to defaults is preserved as-is
+          (never silently dropped — e.g. a section added by a newer version
+          of the app, or user data from a future config format).
+        - Nested dicts are merged recursively rather than replaced wholesale.
+
+        This replaces a previous implementation that merged section-by-section
+        with hardcoded lines (`merged["paths"].update(...)`, etc.) — any
+        section added to DEFAULT_CONFIG without a matching hardcoded line
+        there would have its saved values silently discarded on every load.
+        """
+        if not isinstance(saved, dict):
+            return defaults
+        merged = dict(defaults)
+        for key, saved_val in saved.items():
+            if key in merged and isinstance(merged[key], dict) and isinstance(saved_val, dict):
+                merged[key] = ConfigManager._deep_merge(merged[key], saved_val)
+            else:
+                merged[key] = saved_val
+        return merged
 
     def save(self, data: dict = None):
         if data is None:
@@ -1134,6 +1213,8 @@ class FileProcessor:
             if os.path.getsize(file_path) == 0:
                 raise ValueError("File is empty (0 bytes)")
 
+            doc_hash = FileProcessor._file_hash(file_path)
+
             # Decide extraction method. Vision mode is only honored when:
             #   1. The user selected it in Settings, AND
             #   2. The selected model is on the local vision allowlist.
@@ -1159,6 +1240,16 @@ class FileProcessor:
             raw_client = result.get("client", "NEEDS_REVIEW").strip().strip("\"'")
             raw_desc = result.get("desc", "Unknown Document")
             confidence = result.get("confidence", "low")
+            raw_confidence = confidence
+
+            # First 2000 chars of the actual extracted text, for later
+            # learning/dedupe features. Vision mode reads images, not text,
+            # so there's nothing textual to capture there.
+            extracted_text = (
+                extraction.content[:2000]
+                if extraction.content_type == "text" and extraction.content
+                else ""
+            )
 
             # Log what the AI returned so failures are easy to diagnose
             logging.info(f"{filename}: AI returned client='{raw_client}' confidence={confidence}")
@@ -1228,6 +1319,10 @@ class FileProcessor:
                 confidence=confidence,
                 renamed_at=renamed_at,
                 extraction_method=extraction.method,
+                raw_client=raw_client,
+                raw_confidence=raw_confidence,
+                extracted_text=extracted_text,
+                doc_hash=doc_hash,
             )
 
         except Exception as e:
@@ -1250,17 +1345,64 @@ class FileProcessor:
         lower = desc.lower()
         return any(p in lower for p in FileProcessor._FAX_DESC_PATTERNS)
 
+    # Small joining words that stay lowercase when they aren't the first
+    # token of the subject (e.g. "Reduction Request to Chiropractic Works").
+    _LOWERCASE_JOINERS = {
+        "to", "of", "and", "for", "in", "on", "at", "by", "the", "a", "an",
+        "with", "from", "vs",
+    }
+
     @staticmethod
-    def _safe_subject(text: str) -> str:
+    def _is_acronym(token: str) -> bool:
+        """True if `token` is an ALL-CAPS 2-5 char run of letters (PPR, TTD,
+        IME, MRI, EMG, NCV, PPD, TTP, DOI, DOB, PT, OT, ...). Trailing
+        punctuation (e.g. a stray period) is ignored when checking."""
+        core = token.strip(".,;:!?")
+        return 2 <= len(core) <= 5 and core.isalpha() and core.isupper()
+
+    @staticmethod
+    def _safe_subject(text: str, preserve_acronyms: bool = True) -> str:
+        # Replace slashes and underscores with spaces BEFORE stripping illegal
+        # characters, so "EMG/NCV" -> "EMG NCV" and "Incoming_Document" ->
+        # "Incoming Document" instead of the words being silently fused.
+        text = text.replace("/", " ").replace("_", " ")
         text = ILLEGAL_CHARS_RE.sub("", text)
         text = re.sub(r"\s+", " ", text).strip()
+
+        if not preserve_acronyms:
+            # Legacy behavior: no acronym awareness at all.
+            text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
+            text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
+            return text.title()
+
         # Split run-on words: insert space before uppercase letters that follow
-        # a lowercase letter (e.g. "RetainerAgreement" → "Retainer Agreement")
-        # or before an uppercase letter followed by a lowercase when preceded by
-        # another uppercase (e.g. "PDFDocument" → "PDF Document").
-        text = re.sub(r"([a-z])([A-Z])", r"\1 \2", text)
-        text = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", text)
-        return text.title()
+        # a lowercase letter (e.g. "RetainerAgreement" → "Retainer Agreement").
+        # Skip this when the whole token is already a recognised acronym so
+        # "EMG" or "IME" are never split apart.
+        def _split_run_on(token: str) -> str:
+            if FileProcessor._is_acronym(token):
+                return token
+            token = re.sub(r"([a-z])([A-Z])", r"\1 \2", token)
+            token = re.sub(r"([A-Z]+)([A-Z][a-z])", r"\1 \2", token)
+            return token
+
+        tokens = text.split(" ")
+        split_tokens: List[str] = []
+        for tok in tokens:
+            if not tok:
+                continue
+            split_tokens.extend(_split_run_on(tok).split(" "))
+
+        out_tokens = []
+        for i, tok in enumerate(split_tokens):
+            if FileProcessor._is_acronym(tok):
+                out_tokens.append(tok)
+            elif i > 0 and tok.lower() in FileProcessor._LOWERCASE_JOINERS:
+                out_tokens.append(tok.lower())
+            else:
+                out_tokens.append(tok[:1].upper() + tok[1:].lower() if tok else tok)
+
+        return " ".join(out_tokens).strip()
 
     @staticmethod
     def _resolve_collision(directory: str, filename: str, source_name: str) -> str:
@@ -1277,6 +1419,21 @@ class FileProcessor:
             if not os.path.exists(os.path.join(directory, candidate)):
                 return candidate
             counter += 1
+
+    @staticmethod
+    def _file_hash(path: str) -> str:
+        """Return the sha256 hex digest of a file's bytes, read in chunks.
+        Returns "" on any error (missing file, permission error, etc.) rather
+        than raising — this is a best-effort helper for dedupe/learning
+        features, not something that should ever break processing."""
+        try:
+            h = hashlib.sha256()
+            with open(path, "rb") as f:
+                for chunk in iter(lambda: f.read(65536), b""):
+                    h.update(chunk)
+            return h.hexdigest()
+        except Exception:
+            return ""
 
     @staticmethod
     def _already_processed(filename: str, client_list: list) -> bool:
@@ -1661,7 +1818,7 @@ class ScandocsApp(ttk.Window):
     def __init__(self):
         super().__init__(themename="litera")
         self.withdraw()               # hidden until splash finishes
-        self.title("Speedy Scandocs")
+        self.title(APP_TITLE)
         self.geometry("1500x1000")
         self.minsize(1100, 800)
 
@@ -5205,6 +5362,9 @@ class ScandocsApp(ttk.Window):
         """Called on startup. Skips the check if disabled or if <24h since
         the last attempt. Runs the actual network call on a daemon thread
         so we never block the UI."""
+        if IS_TEST_BUILD:
+            logging.info("Auto-update check skipped: test build.")
+            return
         cfg = self.config_mgr.config.get("updates", {})
         if not cfg.get("check_on_startup", True):
             return
@@ -5223,6 +5383,13 @@ class ScandocsApp(ttk.Window):
         """Kick off the release lookup on a background thread.
         silent=True: no popup if we're up-to-date or offline.
         silent=False (manual "Check now"): always inform the user."""
+        if IS_TEST_BUILD:
+            logging.info("Auto-update check skipped: test build.")
+            if not silent:
+                messagebox.showinfo(
+                    "Check for Updates",
+                    "Auto-update is disabled in test builds.")
+            return
         t = threading.Thread(
             target=self._do_update_check, args=(silent,), daemon=True,
         )
