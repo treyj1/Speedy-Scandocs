@@ -63,6 +63,19 @@ except ImportError:
     PILImage = None
     PILImageTk = None
 
+# Optional — only used by DocumentExtractor._prepare_photo() when
+# reading.deskew_photos is on. NOT in requirements.txt: the production app
+# must work identically without them, so every use is behind this flag and
+# degrades gracefully (see _prepare_photo) when either is missing.
+try:
+    import cv2
+    import numpy as np
+    _CV2_AVAILABLE = True
+except ImportError:
+    cv2 = None
+    np = None
+    _CV2_AVAILABLE = False
+
 
 # ─────────────────────────────────────────────────────────────
 # Constants
@@ -300,6 +313,7 @@ DEFAULT_CONFIG: dict = {
         "deskew_photos": False,
         "vision_escalation": False,
         "extract_claim_numbers": False,
+        "escalation_threshold": 0.35,   # text-quality score below which vision_escalation kicks in
     },
     "learning": {
         "log_corrections": True,            # foundation; harmless, just writes a log
@@ -1043,30 +1057,145 @@ class DocumentExtractor:
     @staticmethod
     def extract(file_path: str, max_chars: int = 4000, max_pages: int = 5,
                 vision_mode: bool = False, max_vision_pages: int = 2,
-                ocr_preprocess: bool = True) -> ExtractionResult:
+                ocr_preprocess: bool = True, skip_fax_cover_pages: bool = False,
+                deskew_photos: bool = False) -> ExtractionResult:
         ext = os.path.splitext(file_path)[1].lower()
         if ext == ".pdf":
             if vision_mode:
-                return DocumentExtractor._from_pdf_vision(file_path, max_vision_pages)
+                return DocumentExtractor._from_pdf_vision(
+                    file_path, max_vision_pages,
+                    skip_fax_cover_pages=skip_fax_cover_pages,
+                )
             return DocumentExtractor._from_pdf(file_path, max_chars, max_pages,
-                                                ocr_preprocess=ocr_preprocess)
+                                                ocr_preprocess=ocr_preprocess,
+                                                skip_fax_cover_pages=skip_fax_cover_pages,
+                                                deskew_photos=deskew_photos)
         elif ext in (".jpg", ".jpeg"):
-            return DocumentExtractor._from_jpeg(file_path)
+            return DocumentExtractor._from_jpeg(file_path, deskew_photos=deskew_photos)
         else:
             raise ValueError(f"Unsupported file type: {ext}")
 
+    # ── Fax / transmission cover page detection (reading.skip_fax_cover_pages) ──
+    #
+    # A fax machine or MFP's own "Send Result Report" / "Transmission
+    # Verification" page is frequently scanned in as page 1 of a document,
+    # ahead of the actual letter. Left in, its boilerplate gets mixed into
+    # whatever text/image is sent to the model and can corrupt the reading
+    # of the real document (see PASS 3 item A). Detection below requires at
+    # least two independent signals so a real letter that merely mentions
+    # "VIA FACSIMILE" or a fax number is never misclassified.
+
+    _TRANSMISSION_PHRASES_RE = re.compile(
+        r"send result report|transmission report|transmission verification|"
+        r"communication result|activity report|journal report|fax confirmation",
+        re.IGNORECASE,
+    )
+    _TRANSMISSION_VENDOR_RE = re.compile(
+        r"KYOCERA|TASKalfa|Canon\s+iR|RICOH|Brother\s+MFC|HP\s+OfficeJet|"
+        r"Xerox\s+WorkCentre",
+        re.IGNORECASE,
+    )
+    _TRANSMISSION_TABLE_HEADERS_RE = [
+        re.compile(r"Job\s*No", re.IGNORECASE),
+        re.compile(r"Total\s*Time", re.IGNORECASE),
+        re.compile(r"Resolution\s*/\s*ECM", re.IGNORECASE),
+        re.compile(r"\bResult\b", re.IGNORECASE),
+        re.compile(r"Destination", re.IGNORECASE),
+        re.compile(r"Firmware\s*Version", re.IGNORECASE),
+        re.compile(r"Page\(s\)", re.IGNORECASE),
+    ]
+
     @staticmethod
-    def _from_pdf_vision(file_path: str, max_vision_pages: int) -> ExtractionResult:
+    def _is_transmission_page(page_text: str) -> bool:
+        """True if `page_text` looks like a fax machine / MFP transmission
+        artifact (a "Send Result Report", activity log, confirmation sheet,
+        etc.) rather than real document content.
+
+        Requires at least two independent signals so a real letter that
+        merely mentions a fax number or "VIA FACSIMILE" is never flagged:
+          - a known report-title phrase ("Send Result Report", "Transmission
+            Verification", ...)
+          - a vendor/MFP banner (KYOCERA, RICOH, Brother MFC, ...)
+          - two or more result-table column headers together (Job No, Total
+            Time, Destination, Result, ...) — any single one of these words
+            can appear innocently elsewhere, but the combination is
+            distinctive of a machine-generated report
+          - very low text volume (< 400 chars), but ONLY as a tie-breaker on
+            top of one of the above — short text alone proves nothing
+        """
+        if not page_text or not page_text.strip():
+            return False
+        text = page_text
+        signals = 0
+        if DocumentExtractor._TRANSMISSION_PHRASES_RE.search(text):
+            signals += 1
+        if DocumentExtractor._TRANSMISSION_VENDOR_RE.search(text):
+            signals += 1
+        header_hits = sum(
+            1 for pat in DocumentExtractor._TRANSMISSION_TABLE_HEADERS_RE
+            if pat.search(text)
+        )
+        if header_hits >= 2:
+            signals += 1
+        if signals >= 1 and len(text.strip()) < 400:
+            signals += 1
+        return signals >= 2
+
+    @staticmethod
+    def _drop_transmission_pages(file_path: str, indices: list, texts: list) -> list:
+        """Given parallel lists of original page indices and their text,
+        return the subset of indices that are NOT transmission artifacts —
+        logging each drop. Safety net: if dropping would remove every page,
+        the original list is returned unchanged (with a log line) rather
+        than ever handing the model zero pages of content."""
+        kept = [
+            idx for idx, txt in zip(indices, texts)
+            if not DocumentExtractor._is_transmission_page(txt)
+        ]
+        if not kept:
+            logging.info(
+                f"{os.path.basename(file_path)}: fax/transmission drop would "
+                "remove all pages — keeping originals"
+            )
+            return indices
+        for idx in indices:
+            if idx not in kept:
+                logging.info(
+                    f"{os.path.basename(file_path)}: dropped page {idx + 1} "
+                    "as fax/transmission cover"
+                )
+        return kept
+
+    @staticmethod
+    def _from_pdf_vision(file_path: str, max_vision_pages: int,
+                          skip_fax_cover_pages: bool = False) -> ExtractionResult:
         """Render the first N pages of a PDF as PNG images and return them
         as a base64 image list for the vision model. Bypasses OCR entirely."""
         if fitz is None:
             raise ImportError("PyMuPDF is not installed. Run: pip install PyMuPDF")
         doc = fitz.open(file_path)
-        page_limit = min(doc.page_count, max(1, max_vision_pages))
+        candidate_indices = list(range(doc.page_count))
+
+        if skip_fax_cover_pages:
+            # Quick text probe per page — cheap even for a scanned/image-only
+            # PDF (returns "" there and _is_transmission_page just says No)
+            # — so a fax cover isn't rendered and doesn't eat into the
+            # vision model's limited page budget.
+            probe_texts = []
+            for i in candidate_indices:
+                try:
+                    probe_texts.append(doc[i].get_text("text"))
+                except Exception:
+                    probe_texts.append("")
+            candidate_indices = DocumentExtractor._drop_transmission_pages(
+                file_path, candidate_indices, probe_texts
+            )
+
+        page_indices = candidate_indices[:max(1, max_vision_pages)]
         scale = DocumentExtractor.IMAGE_RENDER_SCALE
         mat = fitz.Matrix(scale, scale)
         images_b64: List[str] = []
-        for i in range(page_limit):
+        for i in page_indices:
             pix = doc[i].get_pixmap(matrix=mat)
             images_b64.append(base64.b64encode(pix.tobytes("png")).decode("utf-8"))
         doc.close()
@@ -1117,7 +1246,8 @@ class DocumentExtractor:
 
     @staticmethod
     def _from_pdf(file_path: str, max_chars: int, max_pages: int = 5,
-                  ocr_preprocess: bool = True) -> ExtractionResult:
+                  ocr_preprocess: bool = True, skip_fax_cover_pages: bool = False,
+                  deskew_photos: bool = False) -> ExtractionResult:
         if fitz is None:
             raise ImportError("PyMuPDF is not installed. Run: pip install PyMuPDF")
         doc = fitz.open(file_path)
@@ -1139,10 +1269,21 @@ class DocumentExtractor:
         has_native_text = len(all_native_text.strip()) >= 50
 
         if has_native_text:
+            # ── Pass 1b: drop fax/transmission cover pages before anything
+            # downstream (labeling, char budget) ever sees them — dropping
+            # AFTER classification would be too late, the cover text has
+            # already had a chance to corrupt what gets sent to the model.
+            page_indices = list(range(len(page_texts)))
+            if skip_fax_cover_pages:
+                page_indices = DocumentExtractor._drop_transmission_pages(
+                    file_path, page_indices, page_texts
+                )
+
             # ── Pass 2: find pages containing client-identifying labels ────
             labeled_pages = []
             unlabeled_pages = []
-            for i, pt in enumerate(page_texts):
+            for i in page_indices:
+                pt = page_texts[i]
                 snippets = DocumentExtractor._extract_labeled_snippets(pt)
                 if snippets:
                     labeled_pages.append((i, pt, snippets))
@@ -1163,22 +1304,34 @@ class DocumentExtractor:
                     f"({[i+1 for i,_,_ in labeled_pages]}), sending those first"
                 )
             else:
-                # No labeled pages — send all pages sequentially
-                raw_text = all_native_text.strip()[:max_chars]
+                # No labeled pages — send remaining pages sequentially
+                raw_text = "".join(page_texts[i] for i in page_indices).strip()[:max_chars]
 
             doc.close()
             return ExtractionResult(content_type="text", content=raw_text, method="pymupdf")
 
         # ── Image-only PDF: OCR every page up to limit, prioritize labeled ──
         doc.close()
-        ocr_labeled = []
-        ocr_unlabeled = []
+        ocr_results = []  # (index, text) for pages that OCR'd successfully
         for i in range(page_limit):
             ocr_text = DocumentExtractor._ocr_pdf_page(file_path, page_index=i,
                                                         max_chars=max_chars,
-                                                        preprocess=ocr_preprocess)
-            if not ocr_text:
-                continue
+                                                        preprocess=ocr_preprocess,
+                                                        deskew_photos=deskew_photos)
+            if ocr_text:
+                ocr_results.append((i, ocr_text))
+
+        if skip_fax_cover_pages and ocr_results:
+            ocr_indices = [i for i, _ in ocr_results]
+            ocr_texts = [t for _, t in ocr_results]
+            kept = set(DocumentExtractor._drop_transmission_pages(
+                file_path, ocr_indices, ocr_texts
+            ))
+            ocr_results = [(i, t) for i, t in ocr_results if i in kept]
+
+        ocr_labeled = []
+        ocr_unlabeled = []
+        for i, ocr_text in ocr_results:
             snippets = DocumentExtractor._extract_labeled_snippets(ocr_text)
             if snippets:
                 ocr_labeled.append((i, ocr_text, snippets))
@@ -1203,7 +1356,7 @@ class DocumentExtractor:
 
     @staticmethod
     def _ocr_pdf_page(file_path: str, page_index: int, max_chars: int,
-                      preprocess: bool = True) -> str:
+                      preprocess: bool = True, deskew_photos: bool = False) -> str:
         """Run Tesseract OCR on a single PDF page rendered to an image.
         Returns extracted text if >= 50 characters were found, otherwise empty string.
         Returns empty string silently on any error so the caller can fall back gracefully."""
@@ -1220,7 +1373,10 @@ class DocumentExtractor:
             import io
             pil = PILImage.open(io.BytesIO(pix.tobytes("png")))
             if preprocess:
-                pil = DocumentExtractor._preprocess_for_ocr(pil)
+                if deskew_photos:
+                    pil = DocumentExtractor._prepare_photo(pil)
+                else:
+                    pil = DocumentExtractor._preprocess_for_ocr(pil)
             text = pytesseract.image_to_string(pil).strip()
             return text[:max_chars] if len(text) >= 50 else ""
         except Exception as e:
@@ -1271,6 +1427,164 @@ class DocumentExtractor:
             logging.warning(f"OCR preprocessing failed, using raw image: {e}")
             return img
 
+    # One-time flag so a whole batch running without OpenCV logs the
+    # "falling back" notice once instead of once per page/photo.
+    _cv2_unavailable_logged = False
+
+    @staticmethod
+    def _prepare_photo(img):
+        """Perspective-correct, deskew, and adaptively threshold a phone
+        photo of a page (reading.deskew_photos). Used in place of
+        `_preprocess_for_ocr`'s global-Otsu pass, which is actively harmful
+        on a phone photo: paper on a dark/textured background, skewed, with
+        uneven lighting pushes a single whole-frame threshold to the wrong
+        split and destroys the page before OCR ever sees it (see PASS 3
+        item B).
+
+        Pipeline, OpenCV/numpy available:
+          1. Border check — sample a strip around the frame edge and see how
+             much of it is dark/non-white. A clean scan's border is page-
+             white; if this frame doesn't look like "paper on a background",
+             leave it to the existing `_preprocess_for_ocr` unchanged.
+          2. Page detection — Canny edges + contours; take the largest
+             convex 4-point quadrilateral covering 15%-95% of the frame.
+          3. If found, perspective-correct it (getPerspectiveTransform /
+             warpPerspective) to a deskewed rectangle.
+          4. If no quadrilateral is found, fall back to deskew-only:
+             minAreaRect over thresholded text pixels, rotating by the
+             detected angle when it's a plausible small skew (< 20 degrees).
+          5. Adaptive thresholding (Gaussian, generous block size) instead
+             of a single global Otsu split, so shadows/uneven lighting
+             across the photo don't wipe out text in the darker half.
+
+        Returns a PIL Image in every case. Safe by construction:
+          - cv2/numpy missing → logs once at INFO, falls back to
+            `_preprocess_for_ocr` (today's behavior) unchanged.
+          - any exception anywhere in the OpenCV pipeline → logs a warning
+            and returns the ORIGINAL image untouched — page prep must never
+            break OCR.
+        """
+        if not _CV2_AVAILABLE:
+            if not DocumentExtractor._cv2_unavailable_logged:
+                logging.info(
+                    "reading.deskew_photos is on but OpenCV/numpy are not "
+                    "installed — falling back to standard OCR preprocessing."
+                )
+                DocumentExtractor._cv2_unavailable_logged = True
+            return DocumentExtractor._preprocess_for_ocr(img)
+
+        try:
+            arr = np.array(img.convert("RGB"))
+            gray = cv2.cvtColor(arr, cv2.COLOR_RGB2GRAY)
+            h, w = gray.shape[:2]
+
+            # 1. Border check: does this look like a photo of a page sitting
+            # on a background, rather than a clean flatbed/ADF scan?
+            border = max(2, min(h, w) // 40)
+            border_pixels = np.concatenate([
+                gray[:border, :].ravel(),
+                gray[-border:, :].ravel(),
+                gray[:, :border].ravel(),
+                gray[:, -border:].ravel(),
+            ])
+            dark_fraction = float(np.mean(border_pixels < 180)) if border_pixels.size else 0.0
+            if dark_fraction < 0.15:
+                # Border reads as page-white — treat as a normal clean scan
+                # and don't touch it.
+                return DocumentExtractor._preprocess_for_ocr(img)
+
+            # 2. Page detection via contours.
+            blurred = cv2.GaussianBlur(gray, (5, 5), 0)
+            edges = cv2.Canny(blurred, 50, 150)
+            edges = cv2.dilate(edges, np.ones((5, 5), np.uint8), iterations=1)
+            contours, _ = cv2.findContours(edges, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+
+            frame_area = float(h * w)
+            quad = None
+            best_area = 0.0
+            for c in contours:
+                peri = cv2.arcLength(c, True)
+                approx = cv2.approxPolyDP(c, 0.02 * peri, True)
+                if len(approx) == 4 and cv2.isContourConvex(approx):
+                    area = cv2.contourArea(approx)
+                    frac = area / frame_area if frame_area else 0.0
+                    if 0.15 <= frac <= 0.95 and area > best_area:
+                        best_area = area
+                        quad = approx.reshape(4, 2).astype("float32")
+
+            # 3. Perspective-correct if a page quad was found.
+            if quad is not None:
+                working = DocumentExtractor._warp_quad(arr, quad)
+            else:
+                # 4. No quad — deskew-only via minAreaRect on text pixels.
+                working = arr
+                _, thresh = cv2.threshold(
+                    gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU
+                )
+                coords = cv2.findNonZero(thresh)
+                if coords is not None:
+                    rect = cv2.minAreaRect(coords)
+                    angle = rect[-1]
+                    # cv2.minAreaRect's angle convention wraps at -90; fold
+                    # into [-45, 45] so "small skew" means what it says.
+                    if angle < -45:
+                        angle = 90 + angle
+                    if abs(angle) < 20:
+                        center = (w / 2, h / 2)
+                        rot_m = cv2.getRotationMatrix2D(center, angle, 1.0)
+                        working = cv2.warpAffine(
+                            arr, rot_m, (w, h), flags=cv2.INTER_CUBIC,
+                            borderMode=cv2.BORDER_REPLICATE,
+                        )
+
+            # 5. Adaptive threshold — robust to uneven lighting/shadows,
+            # unlike a single global Otsu split over the whole frame.
+            working_gray = (
+                cv2.cvtColor(working, cv2.COLOR_RGB2GRAY) if working.ndim == 3 else working
+            )
+            block_size = max(15, (min(working_gray.shape[:2]) // 8) | 1)  # odd, generous
+            adaptive = cv2.adaptiveThreshold(
+                working_gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                cv2.THRESH_BINARY, block_size, 15,
+            )
+            return PILImage.fromarray(adaptive)
+        except Exception as e:
+            logging.warning(f"Photo page preparation failed, using original image: {e}")
+            return img
+
+    @staticmethod
+    def _warp_quad(arr, quad):
+        """Perspective-warp `arr` so the 4-point quad (any order) becomes a
+        flat, deskewed rectangle sized from the quad's own edge lengths."""
+        tl, tr, br, bl = DocumentExtractor._order_quad_points(quad)
+        width_a = np.linalg.norm(br - bl)
+        width_b = np.linalg.norm(tr - tl)
+        max_width = max(int(width_a), int(width_b), 1)
+        height_a = np.linalg.norm(tr - br)
+        height_b = np.linalg.norm(tl - bl)
+        max_height = max(int(height_a), int(height_b), 1)
+        dst = np.array([
+            [0, 0],
+            [max_width - 1, 0],
+            [max_width - 1, max_height - 1],
+            [0, max_height - 1],
+        ], dtype="float32")
+        src = np.array([tl, tr, br, bl], dtype="float32")
+        m = cv2.getPerspectiveTransform(src, dst)
+        return cv2.warpPerspective(arr, m, (max_width, max_height))
+
+    @staticmethod
+    def _order_quad_points(pts):
+        """Order 4 arbitrary points as (top-left, top-right, bottom-right,
+        bottom-left) by summed/differenced coordinates."""
+        s = pts.sum(axis=1)
+        diff = np.diff(pts, axis=1).ravel()
+        tl = pts[np.argmin(s)]
+        br = pts[np.argmax(s)]
+        tr = pts[np.argmin(diff)]
+        bl = pts[np.argmax(diff)]
+        return tl, tr, br, bl
+
     @staticmethod
     def _render_pdf_page(file_path: str) -> ExtractionResult:
         if fitz is None:
@@ -1286,11 +1600,195 @@ class DocumentExtractor:
         return ExtractionResult(content_type="image", content=b64, mime_type="image/png", method="vision")
 
     @staticmethod
-    def _from_jpeg(file_path: str) -> ExtractionResult:
+    def _from_jpeg(file_path: str, deskew_photos: bool = False) -> ExtractionResult:
+        # JPEGs (phone photos) always go to the model as an image — there's
+        # no OCR path for them. When reading.deskew_photos is on, run the
+        # same perspective-correct/deskew prep used for photographed PDF
+        # pages before handing the image over, so a skewed photo on a dark
+        # background gets straightened out for whichever model reads it.
+        # Any failure anywhere in this path falls back to the untouched
+        # original bytes — page prep must never break extraction.
+        if deskew_photos and PILImage is not None:
+            try:
+                img = PILImage.open(file_path)
+                img.load()
+                prepared = DocumentExtractor._prepare_photo(img)
+                import io
+                buf = io.BytesIO()
+                prepared.convert("RGB").save(buf, format="PNG")
+                b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
+                return ExtractionResult(content_type="image", content=b64,
+                                        mime_type="image/png", method="vision")
+            except Exception as e:
+                logging.warning(f"Photo prep failed for {file_path}, using original image: {e}")
+
         with open(file_path, "rb") as f:
             img_bytes = f.read()
         b64 = base64.b64encode(img_bytes).decode("utf-8")
         return ExtractionResult(content_type="image", content=b64, mime_type="image/jpeg", method="vision")
+
+    # ── Claim number / date-of-injury / DOB extraction (reading.extract_claim_numbers) ──
+
+    _CLAIM_LABEL_RE = re.compile(
+        r"(?:Claim\s*(?:Number|No\.?|#)|Claim\s*ID|File\s*(?:Number|No\.?|#)|"
+        r"WCS?\s*(?:Claim|No))\s*[:\-]?\s*"
+        r"([A-Za-z0-9][A-Za-z0-9 \-]{3,40}?)(?=\s{2,}|[\n\r]|$)",
+        re.IGNORECASE,
+    )
+    # Reject a captured claim value that's actually a date (M/D/YY, MM-DD-YYYY, ...)
+    _CLAIM_LOOKS_LIKE_DATE_RE = re.compile(r"^\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}$")
+    # ...or a phone number (with or without a hyphen/space separator).
+    _CLAIM_LOOKS_LIKE_PHONE_RE = re.compile(r"^\(?\d{3}\)?[\-\s]?\d{3}[\-\s]?\d{4}$")
+
+    _DATE_VALUE_PATTERN = (
+        r"(\d{1,2}[/\-]\d{1,2}[/\-]\d{2,4}|[A-Za-z]{3,9}\.?\s+\d{1,2},?\s+\d{4})"
+    )
+    _DOI_LABEL_RE = re.compile(
+        r"(?:Date\s+of\s+Injury|D\.?\s*O\.?\s*I\.?|Injury\s+Date|Accident\s+Date|"
+        r"Date\s+of\s+Accident)\s*[:\-]?\s*" + _DATE_VALUE_PATTERN,
+        re.IGNORECASE,
+    )
+    _DOB_LABEL_RE = re.compile(
+        r"(?:D\.?\s*O\.?\s*B\.?|Date\s+of\s+Birth|Birth\s+Date)\s*[:\-]?\s*"
+        + _DATE_VALUE_PATTERN,
+        re.IGNORECASE,
+    )
+
+    @staticmethod
+    def _clean_claim_value(raw: str) -> str:
+        """Trim trailing punctuation and collapse internal spaces — a claim
+        number OCR'd/typed as "1E01 E018 695852" normalizes to
+        "1E01E018695852". Dashes are left in place (some claim numbers use
+        them structurally, e.g. "501-216-260260334")."""
+        val = raw.strip().strip(".,;:")
+        return val.replace(" ", "")
+
+    @staticmethod
+    def _normalize_date(raw: str) -> str:
+        """Normalize a matched date string to YYYY-MM-DD when it can be
+        parsed confidently; otherwise return the raw matched text unchanged
+        rather than guess. Two-digit years: 00-40 -> 20xx, 41-99 -> 19xx."""
+        raw = raw.strip().rstrip(",")
+        m = re.match(r"^(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})$", raw)
+        if m:
+            mo_s, da_s, yr_s = m.groups()
+            mo, da = int(mo_s), int(da_s)
+            if len(yr_s) == 2:
+                yr_i = int(yr_s)
+                yr = 2000 + yr_i if yr_i <= 40 else 1900 + yr_i
+            else:
+                yr = int(yr_s)
+            try:
+                return datetime.date(yr, mo, da).strftime("%Y-%m-%d")
+            except ValueError:
+                return raw
+        m = re.match(r"^([A-Za-z]{3,9})\.?\s+(\d{1,2}),?\s+(\d{4})$", raw)
+        if m:
+            month_name, day_s, year_s = m.groups()
+            for fmt in ("%B", "%b"):
+                try:
+                    parsed_month = datetime.datetime.strptime(month_name.title(), fmt).month
+                    return datetime.date(int(year_s), parsed_month, int(day_s)).strftime("%Y-%m-%d")
+                except ValueError:
+                    continue
+            return raw
+        return raw
+
+    @staticmethod
+    def extract_identifiers(text: str) -> dict:
+        """Best-effort extraction of a claim number, date of injury, and
+        date of birth from document text, via labeled regex matches
+        (see PASS 3 item C). Returns
+        {"claim_number": str, "date_of_injury": str, "dob": str} with empty
+        strings for anything not confidently found.
+
+        Deliberately conservative: a wrong claim number is worse than none.
+        A claim-number candidate is only accepted when it's 6-30 characters
+        after normalizing (stripping internal spaces) and doesn't look like
+        a date or a phone number — both of which sit right next to claim
+        number labels on real intake forms and are easy to mis-capture.
+        Dates are normalized to YYYY-MM-DD only when confidently parseable;
+        otherwise the raw matched text is kept rather than guessed at.
+        """
+        result = {"claim_number": "", "date_of_injury": "", "dob": ""}
+        if not text:
+            return result
+
+        for m in DocumentExtractor._CLAIM_LABEL_RE.finditer(text):
+            candidate = DocumentExtractor._clean_claim_value(m.group(1))
+            if not (6 <= len(candidate) <= 30):
+                continue
+            if DocumentExtractor._CLAIM_LOOKS_LIKE_DATE_RE.match(candidate):
+                continue
+            if DocumentExtractor._CLAIM_LOOKS_LIKE_PHONE_RE.match(candidate):
+                continue
+            if not re.search(r"[A-Za-z0-9]", candidate):
+                continue
+            result["claim_number"] = candidate
+            break
+
+        m = DocumentExtractor._DOI_LABEL_RE.search(text)
+        if m:
+            result["date_of_injury"] = DocumentExtractor._normalize_date(m.group(1))
+
+        m = DocumentExtractor._DOB_LABEL_RE.search(text)
+        if m:
+            result["dob"] = DocumentExtractor._normalize_date(m.group(1))
+
+        return result
+
+    # ── OCR -> vision escalation ladder (reading.vision_escalation) ──
+
+    _WORD_TOKEN_RE = re.compile(r"^[A-Za-z]{2,}$")
+    _VOWEL_RE = re.compile(r"[aeiouAEIOU]")
+
+    @staticmethod
+    def assess_text_quality(text: str) -> float:
+        """Heuristic 0.0-1.0 score for whether `text` looks like real,
+        usable document text rather than OCR noise (see PASS 3 item D).
+        Used to decide whether reading.vision_escalation should re-read a
+        document with the vision model instead of trusting a bad OCR pass.
+
+        Combines, with no single factor able to carry the score on its own:
+          - length: very short text can't be classified reliably regardless
+            of how clean it looks (scaled up to a 300-char cap)
+          - "real word" ratio: the fraction of whitespace-split tokens that
+            are 2+ letters and contain a vowel. Typical OCR garbage like
+            "1|11 ,, ~~ lll ]{ " produces almost no such tokens, while a
+            clean sentence produces close to 100%.
+          - alphabetic ratio: fraction of all characters that are letters.
+            Numbers/punctuation/whitespace are normal in real documents and
+            aren't penalized alone, but combined with a low word ratio it's
+            a garbage signal.
+          - a flat bonus if a client-identifying label (_CLIENT_LABEL_RE)
+            was found — a strong sign the OCR captured something meaningful.
+
+        Not a proof of correctness, just cheap enough to run on every
+        document.
+        """
+        if not text or not text.strip():
+            return 0.0
+        stripped = text.strip()
+
+        length_score = min(1.0, len(stripped) / 300.0)
+
+        tokens = stripped.split()
+        if not tokens:
+            return 0.0
+        word_like = 0
+        for t in tokens:
+            core = t.strip(".,;:()[]{}\"'-")
+            if DocumentExtractor._WORD_TOKEN_RE.match(core) and DocumentExtractor._VOWEL_RE.search(core):
+                word_like += 1
+        word_ratio = word_like / len(tokens)
+
+        alpha_chars = sum(1 for c in stripped if c.isalpha())
+        alpha_ratio = alpha_chars / len(stripped)
+
+        label_bonus = 0.15 if DocumentExtractor._CLIENT_LABEL_RE.search(stripped) else 0.0
+
+        score = (0.25 * length_score) + (0.45 * word_ratio) + (0.25 * alpha_ratio) + label_bonus
+        return max(0.0, min(1.0, score))
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1548,6 +2046,10 @@ class FileProcessor:
                 and model_supports_vision(config.get("api", {}).get("model", ""))
             )
 
+            reading_cfg = config.get("reading", {})
+            skip_fax_cover_pages = reading_cfg.get("skip_fax_cover_pages", False)
+            deskew_photos = reading_cfg.get("deskew_photos", False)
+
             # Extract content
             extraction = DocumentExtractor.extract(
                 file_path,
@@ -1556,7 +2058,59 @@ class FileProcessor:
                 vision_mode=use_vision,
                 max_vision_pages=proc_cfg.get("max_vision_pages", 2),
                 ocr_preprocess=proc_cfg.get("ocr_preprocess", True),
+                skip_fax_cover_pages=skip_fax_cover_pages,
+                deskew_photos=deskew_photos,
             )
+
+            # ── OCR -> vision escalation (reading.vision_escalation) ──
+            # Only fires when we did NOT already use vision, only ever one
+            # attempt, and only when the currently selected model can
+            # actually see images — otherwise there's nothing to escalate
+            # to and we just say so once and keep the OCR result.
+            if reading_cfg.get("vision_escalation", False) and not use_vision \
+                    and extraction.content_type == "text":
+                model_name = config.get("api", {}).get("model", "")
+                if model_supports_vision(model_name):
+                    escalation_threshold = reading_cfg.get("escalation_threshold", 0.35)
+                    quality = DocumentExtractor.assess_text_quality(extraction.content)
+                    if quality < escalation_threshold:
+                        logging.info(
+                            f"{filename}: text quality {quality:.2f} below "
+                            f"{escalation_threshold} — escalating to vision"
+                        )
+                        try:
+                            vision_extraction = DocumentExtractor.extract(
+                                file_path,
+                                proc_cfg["max_ocr_chars"],
+                                proc_cfg.get("max_pages", 5),
+                                vision_mode=True,
+                                max_vision_pages=proc_cfg.get("max_vision_pages", 2),
+                                ocr_preprocess=proc_cfg.get("ocr_preprocess", True),
+                                skip_fax_cover_pages=skip_fax_cover_pages,
+                                deskew_photos=deskew_photos,
+                            )
+                            prior_method = extraction.method
+                            vision_extraction.method = f"{prior_method}->vision"
+                            extraction = vision_extraction
+                        except Exception as e:
+                            logging.warning(
+                                f"{filename}: vision escalation failed, keeping OCR "
+                                f"result: {e}"
+                            )
+                else:
+                    logging.info(
+                        f"{filename}: vision_escalation is on but model "
+                        f"'{model_name}' is not vision-capable — keeping OCR result"
+                    )
+
+            # ── Claim number / DOI / DOB extraction (reading.extract_claim_numbers) ──
+            # Runs on whatever text ended up being used for classification —
+            # if escalation above switched to vision, there's no text left to
+            # mine and identifiers stay empty for this document.
+            identifiers = {"claim_number": "", "date_of_injury": "", "dob": ""}
+            if reading_cfg.get("extract_claim_numbers", False) \
+                    and extraction.content_type == "text" and extraction.content:
+                identifiers = DocumentExtractor.extract_identifiers(extraction.content)
 
             # Classify via AI
             result = APIClient.classify(extraction, client_list, config)
@@ -1686,6 +2240,14 @@ class FileProcessor:
                 raw_confidence=raw_confidence,
                 extracted_text=extracted_text,
                 doc_hash=doc_hash,
+                claim_number=identifiers.get("claim_number", ""),
+                # doc_date: nothing else in this pass sets it, so date_of_injury
+                # is the only candidate here — but it's a fallback, not the
+                # primary source. A later pass should set doc_date from the
+                # document's own letterhead/signature date when available and
+                # only fall back to DOI when that's genuinely all there is,
+                # since a document is often dated well after the injury.
+                doc_date=identifiers.get("date_of_injury", ""),
                 was_dry_run=dry_run,
             )
 
