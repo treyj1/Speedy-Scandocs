@@ -337,6 +337,7 @@ DEFAULT_CONFIG: dict = {
         "claim_linking": "off",             # "off" | "suggest" | "auto"
         "observations_required": 3,
         "retroactive_rename": "off",        # "off" | "preview"
+        "few_shot_examples": False,         # append similar past corrections to the prompt
     },
     "automation": {
         "dry_run": False,
@@ -489,6 +490,10 @@ class ProcessResult:
     claim_number: str = ""
     was_dry_run: bool = False
     skip_reason: str = ""           # why a file was skipped, for reporting
+    # PASS 6 (learning): how final_client was determined — "" (not resolved
+    # / needs review), "fuzzy" (normal client-list match), "claim" (learned
+    # claim-number linking), "alias" (learned client-relationship linking).
+    match_source: str = ""
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1334,6 +1339,567 @@ class ProviderManager:
 
 
 # ─────────────────────────────────────────────────────────────
+# LearningStore (PASS 6) — the learning loop
+# ─────────────────────────────────────────────────────────────
+#
+# The problem this exists to solve: a named client (Mary) can have other
+# people attached to her matter — e.g. George was a passenger in Mary's
+# accident. George receives mail addressed to him, but it has to be filed
+# under Mary, because she's the client. An employee knows this; the machine
+# doesn't, and there are too many such relationships to enter by hand.
+#
+# Before this pass, FileProcessor.process_file already computed
+# `raw_client` (the model's free-text guess, e.g. "George Martinez") but
+# threw it away the moment fuzzy_match against the client list failed —
+# only the unknown-client label survived. This pass captures that guess
+# instead, backlogs it every time an employee corrects a file (via the
+# Manual Correction panel, the office's actual workflow — NOT the Audit
+# checkboxes, which the office doesn't use), and once enough distinct
+# documents agree on the same raw-name -> client pairing, surfaces it as a
+# suggestion for a human to confirm. Confirmed pairings are then applied
+# automatically to the *next* George document, and can be swept
+# retroactively across every George file the machine already produced.
+#
+# Storage is a single append-only JSONL log (corrections.jsonl — one line
+# per correction/confirmation/observation, human-inspectable, never
+# rewritten) plus a derived JSON index (learning_index.json) rebuilt from
+# it. No sqlite — this is intentionally simple.
+#
+# Guards on alias promotion (all four matter — see rebuild_index):
+#   1. Surname required — a bare first name ("George") can never become an
+#      alias. Common first names recur constantly in this client base; a
+#      bare-first-name alias would misfile everything.
+#   2. Distinct documents only — the same file logged twice (has happened
+#      in production) must not manufacture evidence. Counted by doc_hash.
+#   3. Agreement — >= observations_required distinct docs AND >= 90% of
+#      them pointing at ONE client. Otherwise "ambiguous" and never
+#      surfaced — George may be a passenger in two different accidents, or
+#      there may be two Georges.
+#   4. Never auto-confirmed — promotion only ever produces a *suggestion*.
+#      Only confirm_alias() (called by a human, via the Pass 7 UI) can set
+#      status "confirmed" and make lookup_alias() start returning it.
+
+class LearningStore:
+    """Correction log + derived lookup index, both under the app's user
+    data directory. See the module comment above for the design."""
+
+    LOG_FILENAME = "corrections.jsonl"
+    INDEX_FILENAME = "learning_index.json"
+
+    # Business names harvested out of a corrected description's "to X" /
+    # "from X" phrasing (e.g. "Reduction Request to Chiropractic Works").
+    _PROVIDER_RE = re.compile(
+        r"\b(?:to|from)\s+([A-Z][A-Za-z.&'\-]+(?:\s+[A-Z][A-Za-z.&'\-]+){0,3})"
+    )
+
+    def __init__(self, user_data_dir: str, observations_required: int = 3):
+        self.dir = user_data_dir
+        self.log_path = os.path.join(user_data_dir, self.LOG_FILENAME)
+        self.index_path = os.path.join(user_data_dir, self.INDEX_FILENAME)
+        self.observations_required = max(1, int(observations_required or 3))
+        self.index = self._load_index()
+
+    # ── normalization helpers ───────────────────────────────────────────
+
+    @staticmethod
+    def _normalize_name(name: str) -> str:
+        return re.sub(r"\s+", " ", (name or "").strip().lower())
+
+    @staticmethod
+    def _normalize_for_similarity(text: str) -> str:
+        return re.sub(r"\s+", " ", (text or "")).strip().lower()
+
+    # ── index persistence ────────────────────────────────────────────────
+
+    @staticmethod
+    def _empty_index() -> dict:
+        return {
+            "alias_candidates": {},
+            "doc_type_candidates": {},
+            "provider_candidates": {},
+            "claim_index": {},
+            # Human decisions (confirm_alias/reject_alias), keyed the same
+            # as alias_candidates. Kept separate from the computed stats so
+            # a rebuild never silently forgets a decision a human already
+            # made.
+            "alias_decisions": {},
+        }
+
+    def _load_index(self) -> dict:
+        empty = self._empty_index()
+        if not os.path.isfile(self.index_path):
+            return empty
+        try:
+            with open(self.index_path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                return empty
+            for key, default_val in empty.items():
+                data.setdefault(key, default_val)
+            return data
+        except Exception as e:
+            logging.warning(f"Could not load learning index: {e}")
+            return empty
+
+    def _write_index(self) -> None:
+        tmp = self.index_path + ".tmp"
+        try:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(self.index, f, indent=2)
+            os.replace(tmp, self.index_path)
+        except Exception as e:
+            logging.warning(f"Could not write learning index: {e}")
+
+    # ── the log itself ───────────────────────────────────────────────────
+
+    def _read_all_corrections(self) -> List[dict]:
+        entries: List[dict] = []
+        try:
+            with open(self.log_path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        continue
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logging.warning(f"Could not read corrections log: {e}")
+        return entries
+
+    def _append_entry(self, entry: dict) -> None:
+        entry = dict(entry)
+        entry.setdefault("ts", datetime.datetime.now().isoformat())
+        os.makedirs(self.dir, exist_ok=True)
+        with open(self.log_path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+
+    def log_correction(self, entry: dict) -> None:
+        """Append one correction/confirmation/audit entry and refresh the
+        derived index. Never raises — a logging failure must never block or
+        break the actual rename. This is human-paced (one call per
+        employee action in the Manual Correction panel or Audit submit),
+        so rebuilding the index on every call is cheap in practice.
+
+        Expected shape (see module comment for field meanings):
+            {"ts", "doc_hash", "original_name", "predicted_client",
+             "raw_client", "predicted_desc", "predicted_doc_type",
+             "predicted_recipient", "corrected_client", "corrected_desc",
+             "claim_number", "doc_date", "text_excerpt",
+             "changed_client", "changed_desc", "source"}
+        `source` is "correction" | "confirmation" | "audit" | "observation".
+        """
+        try:
+            self._append_entry(entry)
+        except Exception as e:
+            logging.warning(f"Could not log correction: {e}")
+            return
+        try:
+            self.rebuild_index()
+        except Exception as e:
+            logging.warning(f"Could not rebuild learning index: {e}")
+
+    def log_observation(self, doc_hash: str, raw_client: str, original_name: str,
+                         claim_number: str = "", predicted_desc: str = "",
+                         text_excerpt: str = "") -> None:
+        """Record the model's raw guess for a file that stayed unresolved,
+        WITHOUT any employee correction — learning.client_relationships or
+        claim_linking set to "suggest" (never applies, only records), or
+        "auto" that found nothing to apply. This is the literal "backlog"
+        the owner described: not visible anywhere, just recorded, so that a
+        later confirmed alias can retroactively sweep every other unrenamed
+        file that carried the same raw guess (see plan_retroactive_renames).
+
+        Deliberately does NOT rebuild the index — this can fire once per
+        unresolved file in a batch of thousands, and observations carry no
+        corrected_client so they never feed alias_candidates evidence
+        anyway (see rebuild_index). Never raises."""
+        try:
+            self._append_entry({
+                "doc_hash": doc_hash,
+                "original_name": original_name,
+                "predicted_client": "",
+                "raw_client": raw_client,
+                "predicted_desc": predicted_desc,
+                "predicted_doc_type": "",
+                "predicted_recipient": "",
+                "corrected_client": "",
+                "corrected_desc": "",
+                "claim_number": claim_number,
+                "doc_date": "",
+                "text_excerpt": (text_excerpt or "")[:600],
+                "changed_client": False,
+                "changed_desc": False,
+                "source": "observation",
+            })
+        except Exception as e:
+            logging.warning(f"Could not log observation: {e}")
+
+    # ── rebuilding the index ─────────────────────────────────────────────
+
+    def rebuild_index(self) -> dict:
+        """Walk the whole JSONL log and recompute alias_candidates,
+        doc_type_candidates, provider_candidates, and claim_index from
+        scratch, then persist atomically. Human decisions recorded via
+        confirm_alias/reject_alias (alias_decisions) always take priority
+        over the freshly-computed guard result for that name."""
+        entries = self._read_all_corrections()
+        alias_stats: dict = {}
+        doc_type_stats: dict = {}
+        provider_stats: dict = {}
+        claim_stats: dict = {}
+
+        for e in entries:
+            raw_client = (e.get("raw_client") or "").strip()
+            corrected_client = (e.get("corrected_client") or "").strip()
+            predicted_client = (e.get("predicted_client") or "").strip()
+            doc_hash = (e.get("doc_hash") or "").strip()
+            ts = e.get("ts") or ""
+
+            # Alias evidence only counts when the file was genuinely
+            # unresolved beforehand (predicted_client empty or one of the
+            # model's own NEEDS_REVIEW-style sentinels) — otherwise a
+            # no-op "confirmation" of an already-correct match (raw_client
+            # "Mary Smith" confirmed against canonical "SMITH, Mary") would
+            # manufacture a pointless alias suggestion for a client that
+            # was never actually unresolved.
+            was_unresolved = (not predicted_client) or (
+                predicted_client.upper() in FileProcessor._CLIENT_SENTINELS
+            )
+            if raw_client and corrected_client and was_unresolved \
+                    and FileProcessor._looks_like_person_name(raw_client):
+                norm = self._normalize_name(raw_client)
+                rec = alias_stats.setdefault(norm, {
+                    "raw_display": raw_client, "resolved": {}, "doc_hashes": set(),
+                    "first_seen": ts, "last_seen": ts,
+                })
+                rec["resolved"][corrected_client] = rec["resolved"].get(corrected_client, 0) + 1
+                if doc_hash:
+                    rec["doc_hashes"].add(doc_hash)
+                if ts:
+                    if not rec["first_seen"] or ts < rec["first_seen"]:
+                        rec["first_seen"] = ts
+                    if not rec["last_seen"] or ts > rec["last_seen"]:
+                        rec["last_seen"] = ts
+
+            # Doc-type candidates: a genuinely changed description.
+            corrected_desc = (e.get("corrected_desc") or "").strip()
+            if corrected_desc and e.get("changed_desc"):
+                norm_desc = self._normalize_name(corrected_desc)
+                drec = doc_type_stats.setdefault(norm_desc, {"count": 0, "examples": []})
+                drec["count"] += 1
+                if corrected_desc not in drec["examples"] and len(drec["examples"]) < 5:
+                    drec["examples"].append(corrected_desc)
+
+                # Provider candidates: harvested from "to X" / "from X" in
+                # the same corrected description.
+                for m in self._PROVIDER_RE.finditer(corrected_desc):
+                    prov = m.group(1).strip().rstrip(".")
+                    if len(prov) < 3:
+                        continue
+                    norm_prov = self._normalize_name(prov)
+                    prec = provider_stats.setdefault(norm_prov, {"count": 0, "examples": []})
+                    prec["count"] += 1
+                    if prov not in prec["examples"] and len(prec["examples"]) < 5:
+                        prec["examples"].append(prov)
+
+            claim_number = (e.get("claim_number") or "").strip()
+            if claim_number and corrected_client:
+                crec = claim_stats.setdefault(claim_number, {})
+                crec[corrected_client] = crec.get(corrected_client, 0) + 1
+
+        decisions = self.index.get("alias_decisions", {})
+        alias_candidates: dict = {}
+        for norm, rec in alias_stats.items():
+            doc_hashes = sorted(rec["doc_hashes"])
+            resolved = rec["resolved"]
+            decision = decisions.get(norm)
+            if decision:
+                status = decision["status"]
+                confirmed_client = decision.get("client", "")
+            else:
+                confirmed_client = ""
+                if resolved:
+                    best_client, best_count = max(resolved.items(), key=lambda kv: kv[1])
+                    total_obs = sum(resolved.values())
+                    agreement = (best_count / total_obs) if total_obs else 0.0
+                else:
+                    agreement = 0.0
+                # NOTE: the distinct-document-count guard (>=
+                # observations_required) is enforced by pending_suggestions(),
+                # not here — this keeps "status" a pure read of agreement,
+                # while "surfaced as pending" additionally requires enough
+                # evidence. A same-hash-3x entry can be status "pending"
+                # with only 1 distinct doc; pending_suggestions() filters
+                # it out until more distinct documents agree.
+                status = "pending" if agreement >= 0.90 else "ambiguous"
+            entry = {
+                "raw_display": rec["raw_display"],
+                "resolved": resolved,
+                "doc_hashes": doc_hashes,
+                "first_seen": rec["first_seen"],
+                "last_seen": rec["last_seen"],
+                "status": status,
+            }
+            if confirmed_client:
+                entry["confirmed_client"] = confirmed_client
+            alias_candidates[norm] = entry
+
+        # A decision made on a name with no current supporting stats (e.g.
+        # rejected, then all its corrections happen to age out of a future
+        # trimmed log) must not vanish from the index.
+        for norm, decision in decisions.items():
+            if norm in alias_candidates:
+                continue
+            entry = {
+                "raw_display": decision.get("raw_display", norm),
+                "resolved": {}, "doc_hashes": [], "first_seen": "", "last_seen": "",
+                "status": decision["status"],
+            }
+            if decision.get("client"):
+                entry["confirmed_client"] = decision["client"]
+            alias_candidates[norm] = entry
+
+        self.index = {
+            "alias_candidates": alias_candidates,
+            "doc_type_candidates": doc_type_stats,
+            "provider_candidates": provider_stats,
+            "claim_index": claim_stats,
+            "alias_decisions": decisions,
+        }
+        self._write_index()
+        return self.index
+
+    # ── suggestions / decisions (Pass 7 UI calls these) ────────────────
+
+    def pending_suggestions(self) -> list:
+        """Alias, doc-type, and provider candidates that have cleared their
+        guards but have not yet been confirmed or rejected by a human.
+        Never mutates anything — only confirm_alias/reject_alias do."""
+        out = []
+        for norm, rec in self.index.get("alias_candidates", {}).items():
+            if rec.get("status") != "pending":
+                continue
+            doc_hashes = rec.get("doc_hashes", [])
+            if len(doc_hashes) < self.observations_required:
+                continue
+            resolved = rec.get("resolved", {})
+            if not resolved:
+                continue
+            best_client, _ = max(resolved.items(), key=lambda kv: kv[1])
+            out.append({
+                "kind": "alias",
+                "raw_name": rec.get("raw_display", norm),
+                "resolved_client": best_client,
+                "observations": len(doc_hashes),
+                "doc_hashes": list(doc_hashes),
+                "first_seen": rec.get("first_seen", ""),
+                "last_seen": rec.get("last_seen", ""),
+            })
+
+        for norm, rec in self.index.get("doc_type_candidates", {}).items():
+            if rec.get("count", 0) >= self.observations_required:
+                examples = rec.get("examples", [])
+                out.append({
+                    "kind": "doc_type",
+                    "name": examples[0] if examples else norm,
+                    "count": rec.get("count", 0),
+                    "examples": examples,
+                })
+
+        for norm, rec in self.index.get("provider_candidates", {}).items():
+            if rec.get("count", 0) >= self.observations_required:
+                examples = rec.get("examples", [])
+                out.append({
+                    "kind": "provider",
+                    "name": examples[0] if examples else norm,
+                    "count": rec.get("count", 0),
+                    "examples": examples,
+                })
+
+        return out
+
+    def confirm_alias(self, raw_name: str, client: str) -> None:
+        """Human confirmation (Pass 7 UI) — the only thing that can make
+        lookup_alias() start returning a value for this raw name."""
+        norm = self._normalize_name(raw_name)
+        if not norm:
+            return
+        self.index.setdefault("alias_decisions", {})[norm] = {
+            "status": "confirmed", "client": client, "raw_display": raw_name,
+        }
+        self.rebuild_index()
+
+    def reject_alias(self, raw_name: str) -> None:
+        """Human rejection (Pass 7 UI) — permanently dismisses this raw
+        name so it stops appearing in pending_suggestions()."""
+        norm = self._normalize_name(raw_name)
+        if not norm:
+            return
+        existing = self.index.get("alias_decisions", {}).get(norm, {})
+        self.index.setdefault("alias_decisions", {})[norm] = {
+            "status": "rejected", "client": "",
+            "raw_display": existing.get("raw_display", raw_name),
+        }
+        self.rebuild_index()
+
+    # ── lookups (FileProcessor.process_file calls these) ────────────────
+
+    def lookup_alias(self, raw_name: str) -> str:
+        """The confirmed client for a raw name, or "" if unconfirmed
+        (pending, ambiguous, rejected, or never seen)."""
+        norm = self._normalize_name(raw_name)
+        if not norm:
+            return ""
+        rec = self.index.get("alias_candidates", {}).get(norm)
+        if not rec or rec.get("status") != "confirmed":
+            return ""
+        return rec.get("confirmed_client", "")
+
+    def lookup_claim(self, claim_number: str) -> str:
+        """The client for a claim number, when every logged correction for
+        that claim number agrees on a single client. "" when the claim is
+        unknown or split across more than one client."""
+        claim_number = (claim_number or "").strip()
+        if not claim_number:
+            return ""
+        rec = self.index.get("claim_index", {}).get(claim_number, {})
+        if len(rec) == 1:
+            return next(iter(rec))
+        return ""
+
+    # ── few-shot retrieval (learning.few_shot_examples) ─────────────────
+
+    def find_similar_corrections(self, text: str, doc_type: str = "", limit: int = 3) -> list:
+        """Past corrections whose text_excerpt is most similar to `text`,
+        most-similar first. Similarity is a difflib ratio over a
+        whitespace-collapsed, lowercased comparison; a matching doc_type
+        adds a small bonus. Used for few-shot prompting, but implemented
+        and testable independently of that wiring."""
+        norm_text = self._normalize_for_similarity(text)
+        if not norm_text:
+            return []
+        scored = []
+        for e in self._read_all_corrections():
+            excerpt = e.get("text_excerpt", "")
+            if not excerpt:
+                continue
+            norm_excerpt = self._normalize_for_similarity(excerpt)
+            if not norm_excerpt:
+                continue
+            ratio = difflib.SequenceMatcher(
+                None, norm_text[:2000], norm_excerpt[:2000]
+            ).ratio()
+            entry_doc_type = (e.get("predicted_doc_type") or e.get("corrected_desc") or "")
+            if doc_type and entry_doc_type and doc_type.strip().lower() == entry_doc_type.strip().lower():
+                ratio += 0.1
+            scored.append((ratio, e))
+        scored.sort(key=lambda t: t[0], reverse=True)
+        results = []
+        for ratio, e in scored[:max(0, limit)]:
+            results.append({
+                "text_excerpt": e.get("text_excerpt", ""),
+                "corrected_client": e.get("corrected_client", ""),
+                "corrected_desc": e.get("corrected_desc", ""),
+                "doc_type": e.get("predicted_doc_type", ""),
+                "score": round(ratio, 4),
+            })
+        return results
+
+    # ── retroactive rename planning (Pass 7 wires the preview UI) ───────
+
+    # Sentinel unknown-client filename prefixes — a file starting with one
+    # of these was named by THE MACHINE, never by a human. Kept in sync
+    # with naming.unknown_client_label / naming.no_client_label defaults;
+    # callers may pass additional labels via `extra_unknown_labels` when a
+    # firm has customized them in Settings.
+    _DEFAULT_UNKNOWN_LABELS = ("A-UNKNOWN CLIENT", "A-NEEDS REVIEW")
+
+    def plan_retroactive_renames(self, raw_name: str, client: str, folders: list,
+                                  extra_unknown_labels: Optional[list] = None) -> list:
+        """Given a newly confirmed alias (raw_name -> client), scan
+        `folders` for files that:
+          1. the MACHINE named — the filename starts with an unknown-client
+             label (never a file a human already named), and
+          2. were logged (correction OR observation) with a raw_client
+             matching `raw_name`, identified by doc_hash so this doesn't
+             depend on the file's current name.
+
+        Returns [{"path", "current_name", "proposed_name"}, ...]. Performs
+        NO renames — Pass 7 adds a preview UI with checkboxes and routes
+        the actual renames through RenameLog so they're undoable."""
+        norm = self._normalize_name(raw_name)
+        if not norm or not client:
+            return []
+
+        matching_hashes = set()
+        for e in self._read_all_corrections():
+            if self._normalize_name(e.get("raw_client", "")) == norm:
+                h = (e.get("doc_hash") or "").strip()
+                if h:
+                    matching_hashes.add(h)
+        if not matching_hashes:
+            return []
+
+        unknown_labels = list(self._DEFAULT_UNKNOWN_LABELS)
+        for lbl in (extra_unknown_labels or []):
+            if lbl and lbl not in unknown_labels:
+                unknown_labels.append(lbl)
+
+        proposals = []
+        for folder in folders or []:
+            if not folder or not os.path.isdir(folder):
+                continue
+            try:
+                names = os.listdir(folder)
+            except Exception as e:
+                logging.warning(f"plan_retroactive_renames: could not list {folder}: {e}")
+                continue
+            for name in names:
+                path = os.path.join(folder, name)
+                if not os.path.isfile(path):
+                    continue
+                # SAFETY (non-negotiable): only ever propose a file the
+                # machine itself named — never a file a human already named.
+                if not any(name.upper().startswith(lbl.upper()) for lbl in unknown_labels):
+                    continue
+                file_hash = FileProcessor._file_hash(path)
+                if not file_hash or file_hash not in matching_hashes:
+                    continue
+                ext = os.path.splitext(name)[1]
+                m = re.match(r"^.+? - (.+)\.[^.]+$", name)
+                desc = m.group(1) if m else os.path.splitext(name)[0]
+                proposals.append({
+                    "path": path,
+                    "current_name": name,
+                    "proposed_name": f"{client} - {desc}{ext}",
+                })
+        return proposals
+
+
+# Module-level singleton — shared by FileProcessor (forward alias/claim
+# application during a batch) and APIClient (few-shot examples) so neither
+# reloads/rebuilds the index once per file. observations_required is
+# re-applied from config on every call in case Settings changed it
+# mid-session.
+_learning_store_singleton: Optional["LearningStore"] = None
+
+
+def _get_learning_store(config: dict) -> "LearningStore":
+    global _learning_store_singleton
+    obs_required = (config.get("learning", {}) or {}).get("observations_required", 3)
+    if _learning_store_singleton is None:
+        _learning_store_singleton = LearningStore(_USER_DATA_DIR, observations_required=obs_required)
+    else:
+        _learning_store_singleton.observations_required = max(1, int(obs_required or 3))
+    return _learning_store_singleton
+
+
+# ─────────────────────────────────────────────────────────────
 # DocumentExtractor
 # ─────────────────────────────────────────────────────────────
 
@@ -2111,7 +2677,8 @@ class APIClient:
     @staticmethod
     def _build_prompt(extraction: ExtractionResult, config: Optional[dict] = None,
                        document_types: Optional[list] = None,
-                       candidates: Optional[list] = None) -> str:
+                       candidates: Optional[list] = None,
+                       few_shot_examples: Optional[list] = None) -> str:
         """Build the classification prompt.
 
         With classification.structured_output off (the default, and the
@@ -2119,11 +2686,17 @@ class APIClient:
         byte-for-byte — see _build_legacy_prompt. On, it returns a richer
         prompt asking for doc_type/recipient/direction/doc_date alongside
         client — see _build_structured_prompt.
+
+        `few_shot_examples` (learning.few_shot_examples, off by default) is
+        only ever honored on the structured prompt — see
+        LearningStore.find_similar_corrections.
         """
         cls_cfg = (config or {}).get("classification", {})
         if not cls_cfg.get("structured_output", False):
             return APIClient._build_legacy_prompt(extraction)
-        return APIClient._build_structured_prompt(extraction, cls_cfg, document_types, candidates)
+        return APIClient._build_structured_prompt(
+            extraction, cls_cfg, document_types, candidates, few_shot_examples
+        )
 
     @staticmethod
     def _build_legacy_prompt(extraction: ExtractionResult) -> str:
@@ -2172,7 +2745,8 @@ class APIClient:
     @staticmethod
     def _build_structured_prompt(extraction: ExtractionResult, cls_cfg: dict,
                                   document_types: Optional[list],
-                                  candidates: Optional[list]) -> str:
+                                  candidates: Optional[list],
+                                  few_shot_examples: Optional[list] = None) -> str:
         """Structured-output prompt (classification.structured_output=True).
 
         Differs from the legacy prompt in four deliberate ways, each fixing
@@ -2288,6 +2862,25 @@ class APIClient:
             "unclear."
         )
 
+        # learning.few_shot_examples (off by default) — worked examples
+        # pulled from LearningStore.find_similar_corrections for documents
+        # that read similarly to this one, so the model can see how staff
+        # actually resolved comparable cases.
+        if few_shot_examples:
+            lines.append("")
+            lines.append(
+                "WORKED EXAMPLES — similar documents corrected by staff "
+                "previously (for reference only; base your answer on the "
+                "document above, not on these):"
+            )
+            for ex in few_shot_examples:
+                excerpt = (ex.get("text_excerpt") or "")[:200].replace("\n", " ").strip()
+                lines.append(
+                    f"- Excerpt: \"{excerpt}...\" -> "
+                    f"client: \"{ex.get('corrected_client', '')}\", "
+                    f"doc_type: \"{ex.get('corrected_desc', '')}\""
+                )
+
         lines.append("")
         lines.append("Return ONLY valid JSON with no extra text, in exactly this shape:")
         lines.append(
@@ -2305,7 +2898,22 @@ class APIClient:
         # fuzzy_match (called in FileProcessor) maps the raw name to the authoritative list.
         cls_cfg = config.get("classification", {})
         structured = cls_cfg.get("structured_output", False)
-        prompt = APIClient._build_prompt(extraction, config, document_types, candidates)
+
+        # learning.few_shot_examples (off by default): only meaningful on
+        # the structured prompt, and only when there's text to compare
+        # against past corrections (vision mode reads images, not text).
+        few_shot_examples = None
+        if structured and config.get("learning", {}).get("few_shot_examples", False) \
+                and extraction.content_type == "text" and extraction.content:
+            try:
+                store = _get_learning_store(config)
+                few_shot_examples = store.find_similar_corrections(extraction.content, limit=3) or None
+            except Exception as e:
+                logging.warning(f"Few-shot example lookup failed: {e}")
+
+        prompt = APIClient._build_prompt(
+            extraction, config, document_types, candidates, few_shot_examples
+        )
 
         if config.get("processing", {}).get("debug_log_prompt", False):
             logging.info(f"[DEBUG PROMPT]\n{prompt}\n[END PROMPT]")
@@ -2908,22 +3516,22 @@ class FileProcessor:
             if matched:
                 final_client = matched
                 status = "renamed"
+                match_source = "fuzzy"
             else:
-                # Two distinct unresolved states (naming.split_unknown_states):
-                #   A-UNKNOWN CLIENT — a person's name WAS read but doesn't
-                #     match the client list (the "George was a passenger in
-                #     Mary's accident" case; Pass 6 will learn these).
-                #   A-NEEDS REVIEW — no person name could be read at all, or
-                #     the model returned NEEDS_REVIEW / parsing failed.
-                # Both keep the "A-" prefix so they sort to the top of an
-                # alphabetical folder listing. When the flag is off, both
-                # cases collapse to no_client_label exactly as today.
-                if naming_cfg.get("split_unknown_states", False) \
-                        and FileProcessor._looks_like_person_name(raw_client):
-                    final_client = naming_cfg.get("unknown_client_label", "A-UNKNOWN CLIENT")
-                else:
-                    final_client = naming_cfg.get("no_client_label", "A-NEEDS REVIEW")
-                status = "needs_review"
+                # PASS 6 (learning): before falling back to an unknown-client
+                # label, see if a claim number or a raw-name relationship
+                # already learned from past corrections resolves this file
+                # (the "George was a passenger in Mary's accident" case).
+                final_client, status, match_source = FileProcessor._resolve_unmatched_client(
+                    raw_client=raw_client,
+                    claim_number=identifiers.get("claim_number", ""),
+                    doc_hash=doc_hash,
+                    filename=filename,
+                    raw_desc=raw_desc,
+                    extracted_text=extracted_text,
+                    config=config,
+                    naming_cfg=naming_cfg,
+                )
 
             # Which text feeds the description / {doc_type} placeholder: the
             # model's own printed doc_type when structured_output is on, the
@@ -3076,6 +3684,7 @@ class FileProcessor:
                 recipient=final_recipient,
                 direction=direction,
                 was_dry_run=dry_run,
+                match_source=match_source,
             )
 
         except Exception as e:
@@ -3413,6 +4022,78 @@ class FileProcessor:
         tokens = [t for t in re.split(r"[,\s]+", stripped) if t]
         name_tokens = [t for t in tokens if re.match(r"^[A-Za-z][A-Za-z'\-]*\.?$", t)]
         return len(name_tokens) >= 2
+
+    @staticmethod
+    def _resolve_unmatched_client(raw_client: str, claim_number: str, doc_hash: str,
+                                   filename: str, raw_desc: str, extracted_text: str,
+                                   config: dict, naming_cfg: dict) -> tuple:
+        """PASS 6 payoff: what to do once fuzzy_match has failed, tried in
+        this order before falling back to an unknown-client label:
+
+          1. learning.claim_linking == "auto" and a claim number was read:
+             try LearningStore.lookup_claim. On a hit, use that client.
+          2. learning.client_relationships == "auto": try
+             LearningStore.lookup_alias(raw_client) (the "George is a
+             passenger in Mary's accident" case). On a hit, use that client.
+          3. Either flag set to "suggest" (not "auto"): apply nothing, just
+             record the raw guess as an observation so a later confirmed
+             alias can retroactively sweep this file (see
+             LearningStore.plan_retroactive_renames).
+          4. Both flags "off" (the default): do nothing — byte-for-byte the
+             pre-PASS-6 unknown-label fallback.
+
+        Returns (final_client, status, match_source)."""
+        learning_cfg = config.get("learning", {})
+        claim_mode = learning_cfg.get("claim_linking", "off")
+        alias_mode = learning_cfg.get("client_relationships", "off")
+
+        if claim_mode != "off" or alias_mode != "off":
+            try:
+                store = _get_learning_store(config)
+
+                if claim_mode == "auto" and claim_number:
+                    claim_client = store.lookup_claim(claim_number)
+                    if claim_client:
+                        logging.info(
+                            f"{filename}: claim number '{claim_number}' resolved "
+                            f"to learned client '{claim_client}'"
+                        )
+                        return claim_client, "renamed", "claim"
+
+                if alias_mode == "auto" and FileProcessor._looks_like_person_name(raw_client):
+                    alias_client = store.lookup_alias(raw_client)
+                    if alias_client:
+                        logging.info(
+                            f"{filename}: raw name '{raw_client}' resolved to "
+                            f"learned client '{alias_client}' (alias)"
+                        )
+                        return alias_client, "renamed", "alias"
+
+                if FileProcessor._looks_like_person_name(raw_client) and (
+                        claim_mode == "suggest" or alias_mode == "suggest"):
+                    store.log_observation(
+                        doc_hash=doc_hash, raw_client=raw_client,
+                        original_name=filename, claim_number=claim_number,
+                        predicted_desc=raw_desc, text_excerpt=extracted_text,
+                    )
+            except Exception as e:
+                logging.warning(f"{filename}: learning lookup failed: {e}")
+
+        # Two distinct unresolved states (naming.split_unknown_states):
+        #   A-UNKNOWN CLIENT — a person's name WAS read but doesn't
+        #     match the client list (the "George was a passenger in
+        #     Mary's accident" case; now backlogged for PASS 6 to learn).
+        #   A-NEEDS REVIEW — no person name could be read at all, or
+        #     the model returned NEEDS_REVIEW / parsing failed.
+        # Both keep the "A-" prefix so they sort to the top of an
+        # alphabetical folder listing. When the flag is off, both
+        # cases collapse to no_client_label exactly as today.
+        if naming_cfg.get("split_unknown_states", False) \
+                and FileProcessor._looks_like_person_name(raw_client):
+            final_client = naming_cfg.get("unknown_client_label", "A-UNKNOWN CLIENT")
+        else:
+            final_client = naming_cfg.get("no_client_label", "A-NEEDS REVIEW")
+        return final_client, "needs_review", ""
 
     @staticmethod
     def _already_processed(filename: str, client_list: list,
@@ -5692,6 +6373,55 @@ class ScandocsApp(ttk.Window):
             messagebox.showwarning("File Not Found",
                 f"Could not locate the file:\n{result.final_name}")
 
+    # ── PASS 6 (learning): correction logging ───────────────────────────
+    #
+    # The office doesn't use the Audit checkboxes (too much hassle) but
+    # DOES use the Manual Correction panel — so _corr_commit (below), not
+    # _submit_audit, is where nearly all of the firm's real correction
+    # signal comes from. Both "Close" and "Next →" route through
+    # _corr_commit, so every correction the office makes passes through
+    # this one chokepoint.
+
+    def _log_correction_event(self, result: "ProcessResult",
+                               predicted_client: str, predicted_desc: str,
+                               corrected_client: str, corrected_desc: str,
+                               source: str) -> None:
+        """Log one correction/confirmation/audit event to the LearningStore,
+        gated on learning.log_corrections. Never raises and never blocks a
+        rename — a logging failure here must not affect the file operation
+        that already happened."""
+        if not self.config_mgr.config.get("learning", {}).get("log_corrections", True):
+            return
+        try:
+            changed_client = (corrected_client or "").strip() != (predicted_client or "").strip()
+            changed_desc = (corrected_desc or "").strip() != (predicted_desc or "").strip()
+            entry_source = source
+            if source == "correction" and not changed_client and not changed_desc:
+                # No-change commit through the workflow the office actually
+                # uses is an implicit confirmation the prediction was right
+                # — free audit data from a workflow they already do.
+                entry_source = "confirmation"
+            store = _get_learning_store(self.config_mgr.config)
+            store.log_correction({
+                "doc_hash": getattr(result, "doc_hash", ""),
+                "original_name": getattr(result, "original_name", ""),
+                "predicted_client": predicted_client or "",
+                "raw_client": getattr(result, "raw_client", ""),
+                "predicted_desc": predicted_desc or "",
+                "predicted_doc_type": getattr(result, "doc_type", ""),
+                "predicted_recipient": getattr(result, "recipient", ""),
+                "corrected_client": corrected_client or "",
+                "corrected_desc": corrected_desc or "",
+                "claim_number": getattr(result, "claim_number", ""),
+                "doc_date": getattr(result, "doc_date", ""),
+                "text_excerpt": (getattr(result, "extracted_text", "") or "")[:600],
+                "changed_client": changed_client,
+                "changed_desc": changed_desc,
+                "source": entry_source,
+            })
+        except Exception as e:
+            logging.warning(f"Could not log correction: {e}")
+
     def _corr_commit(self) -> bool:
         """Apply the Manual Correction panel's fields to the file under
         correction: rename it (and move it, if Manual File Mode is on).
@@ -5727,6 +6457,12 @@ class ScandocsApp(ttk.Window):
 
         dry_run = self.config_mgr.config.get("automation", {}).get("dry_run", False)
 
+        # Captured BEFORE the mutations below overwrite result.client /
+        # result.description — these are the model's original prediction,
+        # exactly what PASS 6 needs to backlog.
+        predicted_client = result.client
+        predicted_desc = result.description
+
         ext      = os.path.splitext(current_name)[1].lower()
         safe_sub = FileProcessor._safe_subject(subject) or "Document"
         new_name = f"{client} - {safe_sub}{ext}"
@@ -5750,6 +6486,13 @@ class ScandocsApp(ttk.Window):
                     return True
         else:
             new_name = current_name
+
+        # PASS 6: log against the ORIGINAL ProcessResult (still holding the
+        # model's raw_client/doc_hash/etc.) before it's overwritten below.
+        self._log_correction_event(
+            result, predicted_client, predicted_desc, client, subject,
+            source="correction",
+        )
 
         result.final_name           = new_name
         result.client               = client
@@ -7290,6 +8033,12 @@ class ScandocsApp(ttk.Window):
                     if self.config_mgr.config.get("safety", {}).get("undo_log", True):
                         log_rename(getattr(self.engine, "batch_id", "") or "manual",
                                    "rename", src, dst, "audit")
+                    # PASS 6: the office doesn't really use Audit, but it's
+                    # cheap to log here too in case they ever do.
+                    self._log_correction_event(
+                        result, result.client, result.description,
+                        new_client, new_desc, source="audit",
+                    )
                     result.final_name = resolved
                     result.audit_corrected_name = resolved
                     # Refresh the treeview row
