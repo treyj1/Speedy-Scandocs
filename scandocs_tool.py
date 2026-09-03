@@ -3145,7 +3145,19 @@ class APIClient:
             timeout=(api_cfg["timeout_connect"], api_cfg["timeout_read"])
         )
         resp.raise_for_status()
-        return resp.json().get("response", "")
+        body = resp.json()
+        # Ollama can return HTTP 200 with an error payload instead of a
+        # completion — e.g. {"error": "model 'X' not found, try pulling it
+        # first"} when the configured model isn't pulled, or a schema
+        # rejection when `format` is a JSON-schema object the installed
+        # Ollama version doesn't support. raise_for_status() doesn't catch
+        # this (200 is still 200), and silently falling back to "" here
+        # made every such failure look identical to "the model returned
+        # unparseable text" with no way to tell them apart in the log.
+        if "response" not in body:
+            err = body.get("error") or json.dumps(body)[:300]
+            raise ValueError(f"Ollama returned no completion — {err}")
+        return body["response"]
 
     @staticmethod
     def _find_balanced_json_object(raw: str) -> Optional[str]:
