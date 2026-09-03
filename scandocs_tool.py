@@ -500,6 +500,7 @@ def compute_settings_dependency_state(cfg: dict) -> dict:
       "classification.extract_recipient"   requires structured_output
       "naming.include_recipient"           requires classification.extract_recipient
       "reading.vision_escalation"          requires a vision-capable model
+      "reading.deskew_photos"              requires OpenCV/numpy in the build
     """
     classification = (cfg or {}).get("classification", {}) or {}
     api = (cfg or {}).get("api", {}) or {}
@@ -523,6 +524,15 @@ def compute_settings_dependency_state(cfg: dict) -> dict:
         "classification.extract_recipient":  (not structured_on, "" if structured_on else need_structured),
         "naming.include_recipient":          (not extract_recipient_on, "" if extract_recipient_on else need_recipient),
         "reading.vision_escalation":         (not vision_ok, vision_reason),
+        # OpenCV/numpy are deliberately absent from requirements.txt, so in
+        # a normal build _prepare_photo can only log a warning and fall
+        # back. Say that in the UI rather than offering a switch that
+        # silently does nothing.
+        "reading.deskew_photos": (
+            not _CV2_AVAILABLE,
+            "" if _CV2_AVAILABLE else
+            "Not available in this build — needs OpenCV, which isn't included",
+        ),
     }
 
 
@@ -601,8 +611,15 @@ class ConfigManager:
             logging.warning(f"Could not load config.json: {e}. Using defaults.")
             return self._deep_copy(DEFAULT_CONFIG)
 
+    # Config dicts that are USER DATA, not a set of named settings: a
+    # saved value replaces the default outright instead of being merged
+    # key-by-key over it. Without this, recursive merging re-adds any entry
+    # the user deleted — every app start would resurrect the stock
+    # naming.templates rows they had removed, with no way to get rid of them.
+    REPLACE_WHOLESALE_PATHS = frozenset({"naming.templates"})
+
     @staticmethod
-    def _deep_merge(defaults: dict, saved: dict) -> dict:
+    def _deep_merge(defaults: dict, saved: dict, _path: str = "") -> dict:
         """Recursively merge `saved` (loaded from disk) over `defaults`.
 
         - A saved scalar overrides the default.
@@ -616,13 +633,20 @@ class ConfigManager:
         with hardcoded lines (`merged["paths"].update(...)`, etc.) — any
         section added to DEFAULT_CONFIG without a matching hardcoded line
         there would have its saved values silently discarded on every load.
+
+        `_path` tracks position so REPLACE_WHOLESALE_PATHS (below) can opt
+        specific dicts out of recursive merging.
         """
         if not isinstance(saved, dict):
             return defaults
         merged = dict(defaults)
         for key, saved_val in saved.items():
-            if key in merged and isinstance(merged[key], dict) and isinstance(saved_val, dict):
-                merged[key] = ConfigManager._deep_merge(merged[key], saved_val)
+            child_path = f"{_path}.{key}" if _path else key
+            if child_path in ConfigManager.REPLACE_WHOLESALE_PATHS \
+                    and isinstance(saved_val, dict):
+                merged[key] = saved_val
+            elif key in merged and isinstance(merged[key], dict) and isinstance(saved_val, dict):
+                merged[key] = ConfigManager._deep_merge(merged[key], saved_val, child_path)
             else:
                 merged[key] = saved_val
         return merged
@@ -1471,18 +1495,59 @@ class LearningStore:
     LOG_FILENAME = "corrections.jsonl"
     INDEX_FILENAME = "learning_index.json"
 
+    # ── Growth control ───────────────────────────────────────────────────
+    # The log is append-only and grows for the life of an installation:
+    # log_observation() writes one line per unresolved file per batch, so a
+    # busy office adds thousands of lines a week. Two guards keep that from
+    # turning into a slow, then unusable, app:
+    #
+    #   MAX_FEWSHOT_SCAN  find_similar_corrections runs a difflib ratio per
+    #                     entry and is called ONCE PER DOCUMENT during a
+    #                     batch. Unbounded, that measured 0.24s at 500
+    #                     entries, 0.93s at 2k and 4.87s at 10k — per file,
+    #                     getting worse every run. Only the most recent
+    #                     entries are scanned; older corrections are still
+    #                     kept, indexed and counted as evidence, they just
+    #                     stop being candidate few-shot examples.
+    #
+    #   MAX_LOG_ENTRIES   hard ceiling on the log itself. Trimming keeps the
+    #                     newest entries; alias/claim decisions already
+    #                     confirmed by a human live in the index's
+    #                     *_decisions maps and survive trimming (see
+    #                     rebuild_index), so nothing a human decided is lost.
+    MAX_FEWSHOT_SCAN = 2000
+    MAX_LOG_ENTRIES = 50000
+    TRIM_TO_ENTRIES = 40000
+
     # Business names harvested out of a corrected description's "to X" /
     # "from X" phrasing (e.g. "Reduction Request to Chiropractic Works").
     _PROVIDER_RE = re.compile(
         r"\b(?:to|from)\s+([A-Z][A-Za-z.&'\-]+(?:\s+[A-Z][A-Za-z.&'\-]+){0,3})"
     )
 
-    def __init__(self, user_data_dir: str, observations_required: int = 3):
+    def __init__(self, user_data_dir: str, observations_required: int = 3,
+                  sentinel_labels: Optional[list] = None):
         self.dir = user_data_dir
         self.log_path = os.path.join(user_data_dir, self.LOG_FILENAME)
         self.index_path = os.path.join(user_data_dir, self.INDEX_FILENAME)
         self.observations_required = max(1, int(observations_required or 3))
+        # Firm-customized unknown-client labels (naming.unknown_client_label /
+        # naming.no_client_label). Checked alongside the built-in sentinels
+        # so a renamed placeholder can't slip through as a real client.
+        self.sentinel_labels = list(sentinel_labels or [])
+        # This store is reached from BOTH the UI thread (correction commits,
+        # Suggestions tab accept/reject) and the batch worker thread
+        # (alias/claim lookups, observations). Every log append and every
+        # index mutation goes through this lock so a rebuild can't race an
+        # append and silently drop evidence.
+        self._lock = threading.RLock()
+        self._observations_since_trim_check = 0
         self.index = self._load_index()
+
+    def is_sentinel(self, name: str) -> bool:
+        """True if `name` is an unresolved-placeholder label rather than a
+        real client — see FileProcessor.is_sentinel_client."""
+        return FileProcessor.is_sentinel_client(name, self.sentinel_labels)
 
     # ── normalization helpers ───────────────────────────────────────────
 
@@ -1565,9 +1630,36 @@ class LearningStore:
     def _append_entry(self, entry: dict) -> None:
         entry = dict(entry)
         entry.setdefault("ts", datetime.datetime.now().isoformat())
-        os.makedirs(self.dir, exist_ok=True)
-        with open(self.log_path, "a", encoding="utf-8") as f:
-            f.write(json.dumps(entry) + "\n")
+        with self._lock:
+            os.makedirs(self.dir, exist_ok=True)
+            with open(self.log_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+
+    def _trim_log_if_needed(self) -> bool:
+        """Keep corrections.jsonl bounded (see MAX_LOG_ENTRIES). Rewrites
+        the file with only the newest TRIM_TO_ENTRIES lines, atomically.
+        Returns True if a trim happened. Never raises — a trim failure is
+        a housekeeping problem, not a reason to break a correction."""
+        try:
+            with self._lock:
+                if not os.path.isfile(self.log_path):
+                    return False
+                with open(self.log_path, "r", encoding="utf-8") as f:
+                    lines = f.readlines()
+                if len(lines) <= self.MAX_LOG_ENTRIES:
+                    return False
+                keep = lines[-self.TRIM_TO_ENTRIES:]
+                tmp = self.log_path + ".tmp"
+                with open(tmp, "w", encoding="utf-8") as f:
+                    f.writelines(keep)
+                os.replace(tmp, self.log_path)
+                logging.info(
+                    f"Trimmed corrections log from {len(lines)} to {len(keep)} entries."
+                )
+                return True
+        except Exception as e:
+            logging.warning(f"Could not trim corrections log: {e}")
+            return False
 
     def log_correction(self, entry: dict) -> None:
         """Append one correction/confirmation/audit entry and refresh the
@@ -1589,6 +1681,7 @@ class LearningStore:
         except Exception as e:
             logging.warning(f"Could not log correction: {e}")
             return
+        self._trim_log_if_needed()
         try:
             self.rebuild_index()
         except Exception as e:
@@ -1627,6 +1720,15 @@ class LearningStore:
                 "changed_desc": False,
                 "source": "observation",
             })
+            # Observations are the fastest-growing source of log lines (one
+            # per unresolved file per batch). Checking the size on every
+            # append would re-read the whole file per document, so amortize
+            # it — a few hundred lines of overshoot past MAX_LOG_ENTRIES is
+            # harmless.
+            self._observations_since_trim_check += 1
+            if self._observations_since_trim_check >= 500:
+                self._observations_since_trim_check = 0
+                self._trim_log_if_needed()
         except Exception as e:
             logging.warning(f"Could not log observation: {e}")
 
@@ -1637,7 +1739,15 @@ class LearningStore:
         doc_type_candidates, provider_candidates, and claim_index from
         scratch, then persist atomically. Human decisions recorded via
         confirm_alias/reject_alias (alias_decisions) always take priority
-        over the freshly-computed guard result for that name."""
+        over the freshly-computed guard result for that name.
+
+        Holds the store lock for the whole read-compute-write cycle so a
+        concurrent append from the batch worker can't land between the read
+        and the write and be lost."""
+        with self._lock:
+            return self._rebuild_index_locked()
+
+    def _rebuild_index_locked(self) -> dict:
         entries = self._read_all_corrections()
         alias_stats: dict = {}
         doc_type_stats: dict = {}
@@ -1661,7 +1771,16 @@ class LearningStore:
             was_unresolved = (not predicted_client) or (
                 predicted_client.upper() in FileProcessor._CLIENT_SENTINELS
             )
-            if raw_client and corrected_client and was_unresolved \
+            # The corrected side must be a REAL client. A no-change commit
+            # on a still-unresolved row (browsing rows with the Manual
+            # Correction panel open does exactly this) records
+            # corrected_client == "A-NEEDS REVIEW"; counting that as
+            # evidence would eventually surface 'file <raw name> under
+            # A-NEEDS REVIEW' as a suggestion, and accepting it would
+            # rename real documents to the placeholder while reporting them
+            # as successfully renamed.
+            corrected_is_real = bool(corrected_client) and not self.is_sentinel(corrected_client)
+            if raw_client and corrected_is_real and was_unresolved \
                     and FileProcessor._looks_like_person_name(raw_client):
                 norm = self._normalize_name(raw_client)
                 rec = alias_stats.setdefault(norm, {
@@ -1698,8 +1817,10 @@ class LearningStore:
                     if prov not in prec["examples"] and len(prec["examples"]) < 5:
                         prec["examples"].append(prov)
 
+            # Same gate for claim linking — a claim number must never be
+            # learned as pointing at an unresolved-placeholder label.
             claim_number = (e.get("claim_number") or "").strip()
-            if claim_number and corrected_client:
+            if claim_number and corrected_is_real:
                 crec = claim_stats.setdefault(claim_number, {})
                 crec[corrected_client] = crec.get(corrected_client, 0) + 1
 
@@ -1784,6 +1905,10 @@ class LearningStore:
             if not resolved:
                 continue
             best_client, _ = max(resolved.items(), key=lambda kv: kv[1])
+            # An index written before the sentinel guard existed can still
+            # hold placeholder-valued candidates — never offer one.
+            if self.is_sentinel(best_client):
+                continue
             out.append({
                 "kind": "alias",
                 "raw_name": rec.get("raw_display", norm),
@@ -1828,10 +1953,19 @@ class LearningStore:
         norm = self._normalize_name(raw_name)
         if not norm:
             return
-        self.index.setdefault("alias_decisions", {})[norm] = {
-            "status": "confirmed", "client": client, "raw_display": raw_name,
-        }
-        self.rebuild_index()
+        # Refuse to confirm a placeholder as a client, even if a stale
+        # index (written before this guard existed) offered one.
+        if not client or self.is_sentinel(client):
+            logging.warning(
+                f"Refusing to confirm alias '{raw_name}' -> '{client}': "
+                "that is an unresolved-placeholder label, not a client."
+            )
+            return
+        with self._lock:
+            self.index.setdefault("alias_decisions", {})[norm] = {
+                "status": "confirmed", "client": client, "raw_display": raw_name,
+            }
+            self.rebuild_index()
 
     def reject_alias(self, raw_name: str) -> None:
         """Human rejection (Pass 7 UI) — permanently dismisses this raw
@@ -1839,12 +1973,13 @@ class LearningStore:
         norm = self._normalize_name(raw_name)
         if not norm:
             return
-        existing = self.index.get("alias_decisions", {}).get(norm, {})
-        self.index.setdefault("alias_decisions", {})[norm] = {
-            "status": "rejected", "client": "",
-            "raw_display": existing.get("raw_display", raw_name),
-        }
-        self.rebuild_index()
+        with self._lock:
+            existing = self.index.get("alias_decisions", {}).get(norm, {})
+            self.index.setdefault("alias_decisions", {})[norm] = {
+                "status": "rejected", "client": "",
+                "raw_display": existing.get("raw_display", raw_name),
+            }
+            self.rebuild_index()
 
     def accept_doc_type_candidate(self, name: str) -> None:
         """Human accepted a suggested document type (Pass 7 Suggestions
@@ -1854,10 +1989,11 @@ class LearningStore:
         norm = self._normalize_name(name)
         if not norm:
             return
-        self.index.setdefault("doc_type_decisions", {})[norm] = {
-            "status": "accepted", "name": name,
-        }
-        self.rebuild_index()
+        with self._lock:
+            self.index.setdefault("doc_type_decisions", {})[norm] = {
+                "status": "accepted", "name": name,
+            }
+            self.rebuild_index()
 
     def reject_doc_type_candidate(self, name: str) -> None:
         """Human dismissed a suggested document type — permanently stops
@@ -1865,10 +2001,11 @@ class LearningStore:
         norm = self._normalize_name(name)
         if not norm:
             return
-        self.index.setdefault("doc_type_decisions", {})[norm] = {
-            "status": "rejected", "name": name,
-        }
-        self.rebuild_index()
+        with self._lock:
+            self.index.setdefault("doc_type_decisions", {})[norm] = {
+                "status": "rejected", "name": name,
+            }
+            self.rebuild_index()
 
     def accept_provider_candidate(self, name: str) -> None:
         """Human accepted a suggested provider. Marks it decided; the UI
@@ -1876,20 +2013,22 @@ class LearningStore:
         norm = self._normalize_name(name)
         if not norm:
             return
-        self.index.setdefault("provider_decisions", {})[norm] = {
-            "status": "accepted", "name": name,
-        }
-        self.rebuild_index()
+        with self._lock:
+            self.index.setdefault("provider_decisions", {})[norm] = {
+                "status": "accepted", "name": name,
+            }
+            self.rebuild_index()
 
     def reject_provider_candidate(self, name: str) -> None:
         """Human dismissed a suggested provider."""
         norm = self._normalize_name(name)
         if not norm:
             return
-        self.index.setdefault("provider_decisions", {})[norm] = {
-            "status": "rejected", "name": name,
-        }
-        self.rebuild_index()
+        with self._lock:
+            self.index.setdefault("provider_decisions", {})[norm] = {
+                "status": "rejected", "name": name,
+            }
+            self.rebuild_index()
 
     # ── lookups (FileProcessor.process_file calls these) ────────────────
 
@@ -1902,7 +2041,10 @@ class LearningStore:
         rec = self.index.get("alias_candidates", {}).get(norm)
         if not rec or rec.get("status") != "confirmed":
             return ""
-        return rec.get("confirmed_client", "")
+        client = rec.get("confirmed_client", "")
+        # Last line of defence: never hand back a placeholder as a client,
+        # however it got into the index.
+        return "" if self.is_sentinel(client) else client
 
     def lookup_claim(self, claim_number: str) -> str:
         """The client for a claim number, when every logged correction for
@@ -1913,7 +2055,8 @@ class LearningStore:
             return ""
         rec = self.index.get("claim_index", {}).get(claim_number, {})
         if len(rec) == 1:
-            return next(iter(rec))
+            client = next(iter(rec))
+            return "" if self.is_sentinel(client) else client
         return ""
 
     # ── few-shot retrieval (learning.few_shot_examples) ─────────────────
@@ -1928,7 +2071,10 @@ class LearningStore:
         if not norm_text:
             return []
         scored = []
-        for e in self._read_all_corrections():
+        # Newest-first, capped — see MAX_FEWSHOT_SCAN. This runs once per
+        # document in a batch, so it must not scale with the whole log.
+        recent = self._read_all_corrections()[-self.MAX_FEWSHOT_SCAN:]
+        for e in recent:
             excerpt = e.get("text_excerpt", "")
             if not excerpt:
                 continue
@@ -2031,16 +2177,30 @@ class LearningStore:
 # re-applied from config on every call in case Settings changed it
 # mid-session.
 _learning_store_singleton: Optional["LearningStore"] = None
+_learning_store_lock = threading.Lock()
 
 
 def _get_learning_store(config: dict) -> "LearningStore":
     global _learning_store_singleton
-    obs_required = (config.get("learning", {}) or {}).get("observations_required", 3)
-    if _learning_store_singleton is None:
-        _learning_store_singleton = LearningStore(_USER_DATA_DIR, observations_required=obs_required)
-    else:
-        _learning_store_singleton.observations_required = max(1, int(obs_required or 3))
-    return _learning_store_singleton
+    learning_cfg = (config.get("learning", {}) or {})
+    naming_cfg = (config.get("naming", {}) or {})
+    obs_required = learning_cfg.get("observations_required", 3)
+    # The firm's own unknown-client labels count as sentinels too, so a
+    # customized placeholder can't be learned as a client either.
+    sentinel_labels = [
+        naming_cfg.get("unknown_client_label", ""),
+        naming_cfg.get("no_client_label", ""),
+    ]
+    with _learning_store_lock:
+        if _learning_store_singleton is None:
+            _learning_store_singleton = LearningStore(
+                _USER_DATA_DIR, observations_required=obs_required,
+                sentinel_labels=sentinel_labels,
+            )
+        else:
+            _learning_store_singleton.observations_required = max(1, int(obs_required or 3))
+            _learning_store_singleton.sentinel_labels = sentinel_labels
+        return _learning_store_singleton
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3262,7 +3422,12 @@ class APIClient:
             resp.raise_for_status()
             return True, f"Connected via OpenWebUI  ({api_cfg['model']})"
         except Exception as e1:
-            pass
+            # Capture the text NOW. Python unbinds the `as` name at the end
+            # of an except block, so referencing `e1` in the second handler
+            # below raised UnboundLocalError — meaning the one case this
+            # message exists for (both endpoints down, i.e. every
+            # misconfigured setup) crashed instead of explaining itself.
+            openwebui_error = str(e1) or e1.__class__.__name__
         # Try Ollama direct
         try:
             url = api_cfg["ollama_url"].rstrip("/") + "/api/generate"
@@ -3276,7 +3441,10 @@ class APIClient:
             resp.raise_for_status()
             return True, f"Connected via Ollama direct  ({api_cfg['model']})"
         except Exception as e2:
-            return False, f"Could not connect.\nOpenWebUI: {e1}\nOllama: {e2}"
+            ollama_error = str(e2) or e2.__class__.__name__
+            return False, (
+                f"Could not connect.\nOpenWebUI: {openwebui_error}\nOllama: {ollama_error}"
+            )
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3796,18 +3964,14 @@ class FileProcessor:
                             skip_reason="file changed during processing",
                             doc_hash=doc_hash,
                         )
-                # Another instance may have renamed this file (to a name
-                # that now looks "already processed") in the time between
-                # our first check and now.
-                if proc_cfg.get("skip_already_processed") and \
-                        FileProcessor._already_processed(filename, client_list, naming_cfg):
-                    return ProcessResult(
-                        original_name=filename,
-                        final_name=filename,
-                        status="skipped",
-                        skip_reason="already handled by another run",
-                        doc_hash=doc_hash,
-                    )
+                # NOTE: there used to be a second _already_processed(filename)
+                # check here, meant to catch "another instance renamed this
+                # file while we were reading it". It could never fire —
+                # `filename` is captured once at the top of this function and
+                # never reassigned, so it re-evaluated the identical check
+                # already made at entry. That case is genuinely covered by
+                # the os.path.isfile and hash re-checks immediately above,
+                # which look at the actual state on disk.
                 dest_path = os.path.join(dest_dir, new_name)
                 os.rename(file_path, dest_path)
                 renamed_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -4162,6 +4326,30 @@ class FileProcessor:
     _CLIENT_SENTINELS = frozenset({"", "NEEDS_REVIEW", "A-NEEDS REVIEW", "A-UNKNOWN CLIENT"})
 
     @staticmethod
+    def is_sentinel_client(name: str, extra_labels: Optional[list] = None) -> bool:
+        """True if `name` is one of the tool's own "unresolved" placeholders
+        rather than a real client — the built-in sentinels above, plus any
+        labels a firm customized in Settings (naming.unknown_client_label /
+        naming.no_client_label), which callers pass via `extra_labels`.
+
+        This is the single gate that keeps a placeholder from ever being
+        treated as a client name. It matters most in LearningStore: a
+        no-change commit on a still-unresolved row records
+        corrected_client == "A-NEEDS REVIEW", and without this check that
+        would accumulate as alias/claim evidence and eventually be offered
+        as 'file George Martinez under A-NEEDS REVIEW'. Accepting that
+        suggestion would rename real documents to the placeholder while
+        marking them "renamed" — filed, to all appearances, but lost.
+        """
+        candidate = (name or "").strip()
+        if candidate.upper() in FileProcessor._CLIENT_SENTINELS:
+            return True
+        for label in (extra_labels or []):
+            if label and candidate.upper() == str(label).strip().upper():
+                return True
+        return False
+
+    @staticmethod
     def _looks_like_person_name(raw_client: str) -> bool:
         """True if `raw_client` plausibly holds a person's name — non-empty,
         not one of the model's own NEEDS_REVIEW-style sentinels, and made up
@@ -4299,6 +4487,18 @@ class ProcessingEngine:
 
     def run_batch(self, config: dict, result_queue: queue.Queue):
         self._stop_event.clear()
+
+        # Work from a private snapshot. The caller hands us the live
+        # ConfigManager.config dict, and nothing stops the user opening
+        # Settings and hitting Save while a batch runs — without this, that
+        # would change the rules mid-batch. automation.dry_run is the
+        # alarming one: flip it halfway and the first half of the run is a
+        # preview while the second half really renames files.
+        try:
+            config = ConfigManager._deep_copy(config)
+        except Exception as e:
+            logging.warning(f"Could not snapshot config for batch ({e}) — using it live.")
+
         scandocs = config["paths"]["scandocs_folder"]
         client_list_path = config["paths"]["client_list_file"]
 
@@ -4327,7 +4527,6 @@ class ProcessingEngine:
                             "Go to the Client List tab, add your clients, and save."
                         ),
                     })
-                    result_queue.put({"type": "done"})
                     return
 
                 try:
@@ -4337,7 +4536,6 @@ class ProcessingEngine:
                         "type": "error",
                         "message": f"Cannot read scandocs folder:\n{e}",
                     })
-                    result_queue.put({"type": "done"})
                     return
 
                 if not files:
@@ -4345,7 +4543,6 @@ class ProcessingEngine:
                         "type": "error",
                         "message": "No PDF or JPG files found in the scandocs folder.",
                     })
-                    result_queue.put({"type": "done"})
                     return
 
                 result_queue.put({"type": "total", "count": len(files)})
@@ -4355,22 +4552,43 @@ class ProcessingEngine:
                 # filesystem (nothing is actually written to disk then).
                 reserved: set = set()
 
-                for i, filename in enumerate(files):
-                    if self._stop_event.is_set():
-                        result_queue.put({"type": "stopped"})
-                        break
+                # Every filename this batch has touched, in EITHER direction:
+                # what we read, and what we renamed it to. The straggler
+                # sweep below subtracts this from a fresh listing, so a file
+                # this batch produced can never be mistaken for a new
+                # arrival. Inferring that from _already_processed() does not
+                # work — it deliberately returns False for the
+                # A-NEEDS REVIEW / A-UNKNOWN CLIENT labels (so those files
+                # are never skipped as "already named"), which meant every
+                # needs-review file the batch produced looked brand new and
+                # was read, classified and billed for a second time.
+                seen_names: set = set(files)
+                processed_count = 0
+
+                def _handle(filename: str, label: str = "") -> None:
+                    nonlocal processed_count
+                    processed_count += 1
                     result_queue.put({
                         "type": "progress",
-                        "current": i + 1,
-                        "filename": filename,
+                        "current": processed_count,
+                        "filename": f"{filename}{label}",
                     })
                     result = FileProcessor.process_file(
                         os.path.join(scandocs, filename), config, client_list,
                         batch_id=self.batch_id, reserved=reserved,
                     )
+                    seen_names.add(filename)
+                    if result.final_name:
+                        seen_names.add(result.final_name)
                     result_queue.put({"type": "result", "result": result})
                     if lock is not None:
                         lock.heartbeat()
+
+                for filename in files:
+                    if self._stop_event.is_set():
+                        result_queue.put({"type": "stopped"})
+                        break
+                    _handle(filename)
 
                 # Straggler pickup: a Dropbox-synced folder can gain new
                 # files while this batch was running (another workstation
@@ -4380,7 +4598,7 @@ class ProcessingEngine:
                 if not self._stop_event.is_set() and not dry_run:
                     try:
                         current = set(self._list_supported_files(scandocs))
-                        stragglers = sorted(current - set(files))
+                        stragglers = sorted(current - seen_names)
                         stragglers = [
                             f for f in stragglers
                             if not (config["processing"].get("skip_already_processed")
@@ -4391,23 +4609,17 @@ class ProcessingEngine:
                         stragglers = []
 
                     logging.info(f"Straggler sweep: {len(stragglers)} newly-arrived file(s) found.")
+                    if stragglers:
+                        result_queue.put({
+                            "type": "total",
+                            "count": processed_count + len(stragglers),
+                        })
 
                     for filename in stragglers:
                         if self._stop_event.is_set():
                             result_queue.put({"type": "stopped"})
                             break
-                        result_queue.put({
-                            "type": "progress",
-                            "current": len(files),
-                            "filename": f"{filename} (newly arrived)",
-                        })
-                        result = FileProcessor.process_file(
-                            os.path.join(scandocs, filename), config, client_list,
-                            batch_id=self.batch_id, reserved=reserved,
-                        )
-                        result_queue.put({"type": "result", "result": result})
-                        if lock is not None:
-                            lock.heartbeat()
+                        _handle(filename, label=" (newly arrived)")
 
             except Exception as e:
                 logging.error(f"Unhandled batch error: {e}", exc_info=True)
@@ -6382,7 +6594,8 @@ class ScandocsApp(ttk.Window):
                  "Ignores the cover sheet and confirmation page so the AI reads the actual document.")
         add_bool(reading_lf, "reading.deskew_photos",
                  "Straighten and crop photographed pages",
-                 "Auto-rotates and trims photos of documents (as opposed to flatbed scans) before reading them.")
+                 "Auto-rotates and trims photos of documents (as opposed to flatbed scans) before reading them.",
+                 dep_key="reading.deskew_photos")
         add_bool(reading_lf, "reading.vision_escalation",
                  "Re-read with vision model when text is unclear",
                  "If the extracted text looks too poor to trust, automatically re-reads the page as "
@@ -7667,13 +7880,20 @@ class ScandocsApp(ttk.Window):
         try:
             changed_client = (corrected_client or "").strip() != (predicted_client or "").strip()
             changed_desc = (corrected_desc or "").strip() != (predicted_desc or "").strip()
+            store = _get_learning_store(self.config_mgr.config)
             entry_source = source
             if source == "correction" and not changed_client and not changed_desc:
-                # No-change commit through the workflow the office actually
-                # uses is an implicit confirmation the prediction was right
-                # — free audit data from a workflow they already do.
+                # A no-change commit is only an implicit confirmation when
+                # there was a real prediction to confirm. On a row that is
+                # still unresolved, "no change" means the employee looked
+                # and moved on — clicking between rows with the Manual
+                # Correction panel open does exactly this — so recording it
+                # as a confirmation of "A-NEEDS REVIEW" would be inventing
+                # agreement that never happened.
+                if store.is_sentinel(corrected_client):
+                    return
+                # Free audit data from a workflow the office already does.
                 entry_source = "confirmation"
-            store = _get_learning_store(self.config_mgr.config)
             store.log_correction({
                 "doc_hash": getattr(result, "doc_hash", ""),
                 "original_name": getattr(result, "original_name", ""),
@@ -7697,8 +7917,14 @@ class ScandocsApp(ttk.Window):
     def _corr_commit(self) -> bool:
         """Apply the Manual Correction panel's fields to the file under
         correction: rename it (and move it, if Manual File Mode is on).
-        Returns False (and shows a message) if the fields aren't valid yet —
-        callers should not close/advance in that case."""
+
+        Returns False (after showing a message) when the fields aren't
+        valid yet. Callers that ADVANCE to another row must honor that and
+        stay put — otherwise the warning flashes up and the half-finished
+        edit is thrown away as the panel rebinds to a different file.
+        Closing is the one exception: _corr_close deliberately ignores the
+        result, because a user must never be trapped in the panel by a
+        validation error they don't want to resolve."""
         iid = self._correction_iid
         if not iid or iid not in self._iid_to_result:
             return True
@@ -7794,8 +8020,10 @@ class ScandocsApp(ttk.Window):
         self._hide_manual_correction()
 
     def _corr_next(self):
-        """Apply the correction (best-effort), then open the next row."""
-        self._corr_commit()
+        """Apply the correction, then open the next row — but stay on this
+        row if the fields didn't validate, so the edit isn't discarded."""
+        if not self._corr_commit():
+            return
         children = self.results_tree.get_children()
         if not children or self._correction_iid not in children:
             self._hide_manual_correction()
@@ -7825,6 +8053,18 @@ class ScandocsApp(ttk.Window):
         # the config changes between runs.
         self.title(APP_TITLE + (" — PREVIEW MODE (no files will be renamed)" if dry_run else ""))
         self._apply_dry_run_banner()
+
+        # Drain anything left over from a previous run. _poll_queue stops
+        # reading the moment it sees "error" or "stopped", so the "done"
+        # that follows stays queued; the next run would then consume that
+        # stale "done" immediately, report "Done. 0 file(s) processed",
+        # re-enable the buttons and stop polling — while the batch it just
+        # started carried on renaming files invisibly in the background.
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
 
         # Clear old results
         self._hide_manual_correction()
@@ -8886,11 +9126,19 @@ class ScandocsApp(ttk.Window):
         # panel's own Next/Close buttons), the panel used to stay silently
         # bound to the old row while the table showed the new one selected
         # -- any edit made after that was then applied to the wrong file.
-        # Best-effort commit the row being left, then switch the panel to
-        # the newly selected one, exactly like the "Next" button does.
+        # Commit the row being left, then switch the panel to the newly
+        # selected one, exactly like the "Next" button does.
+        #
+        # If the commit doesn't validate, put the selection back on the row
+        # under correction instead of switching. Clicking around a results
+        # table is browsing, not saving, so an unfinished edit must not be
+        # silently dropped just because the user looked at another row.
         if (self.correction_panel.winfo_ismapped()
                 and self._correction_iid and self._correction_iid != iid):
-            self._corr_commit()
+            leaving_iid = self._correction_iid
+            if not self._corr_commit():
+                self.results_tree.selection_set(leaving_iid)
+                return
             self._open_manual_correction(iid)
 
         # Update file label
