@@ -8881,6 +8881,18 @@ class ScandocsApp(ttk.Window):
         if not result:
             return
 
+        # If the Manual Correction panel is open on a DIFFERENT row and the
+        # user clicks a row directly in the table (rather than using the
+        # panel's own Next/Close buttons), the panel used to stay silently
+        # bound to the old row while the table showed the new one selected
+        # -- any edit made after that was then applied to the wrong file.
+        # Best-effort commit the row being left, then switch the panel to
+        # the newly selected one, exactly like the "Next" button does.
+        if (self.correction_panel.winfo_ismapped()
+                and self._correction_iid and self._correction_iid != iid):
+            self._corr_commit()
+            self._open_manual_correction(iid)
+
         # Update file label
         self.audit_file_label.config(
             text=result.final_name or result.original_name, foreground="#212529"
