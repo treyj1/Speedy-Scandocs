@@ -304,11 +304,24 @@ DEFAULT_CONFIG: dict = {
         "preserve_acronyms": True,          # safe, pure improvement — on by default
         "include_recipient": False,
         "include_doc_date": False,
-        "templates": {},                    # doc_type -> template string, filled later
+        "use_templates": False,             # False = legacy "{client} - {desc}" construction, byte-for-byte
+        "date_format": "%m-%d-%y",          # e.g. "PPR 07-15-26", matching the office's handwriting convention
+        "split_unknown_states": False,      # False = both cases collapse to no_client_label, as today
+        # doc_type -> template string. [bracketed] segments drop whole when
+        # any placeholder inside them is empty (see NameTemplate). Only
+        # takes effect when use_templates is True.
+        "templates": {
+            "Reduction Request":            "{client} - {doc_type}[ to {recipient}]",
+            "Balance Verification Request": "{client} - {doc_type}[ to {recipient}]",
+            "Medical Records Request":      "{client} - {doc_type}[ to {recipient}]",
+            "PPR":                          "{client} - {doc_type}[ {doc_date}]",
+            "Progress Report":              "{client} - {doc_type}[ {doc_date}]",
+            "Disability Certification":     "{client} - {doc_type}[ {doc_date}]",
+        },
         "default_template": "{client} - {doc_type}",
         "date_disambiguation": False,       # False = legacy "(1)" behavior
-        "unknown_client_label": "A-UNKNOWN CLIENT",
-        "no_client_label": "A-NEEDS REVIEW",   # keep legacy default
+        "unknown_client_label": "A-UNKNOWN CLIENT",  # a name was read but isn't on the client list
+        "no_client_label": "A-NEEDS REVIEW",         # no name could be read at all — keep legacy default
     },
     "reading": {
         "skip_fax_cover_pages": False,
@@ -2503,6 +2516,123 @@ class APIClient:
 
 
 # ─────────────────────────────────────────────────────────────
+# NameTemplate — PASS 5 filename template engine
+# ─────────────────────────────────────────────────────────────
+#
+# Renders a filename stem from structured fields (client, doc_type,
+# recipient, doc_date, claim_number, direction) using a small template
+# language:
+#
+#   {placeholder}       plain substitution — missing/empty fields render ""
+#   [ ...{placeholder}...]   an optional segment: dropped in its entirety
+#                            if ANY placeholder inside it is empty
+#
+# Example: "{client} - {doc_type}[ to {recipient}]" renders as
+# "VALADEZ, Secilia - Reduction Request to Chiropractic Works" when a
+# recipient is known, and "VALADEZ, Secilia - Reduction Request" (no
+# dangling " to") when it isn't.
+#
+# Bracketed groups are a single flat level — nesting ("[a[b]c]") is not
+# supported and is not needed by any template this tool ships.
+#
+# Only used when naming.use_templates is True (FileProcessor.process_file);
+# with that flag off, filename construction is untouched.
+
+class NameTemplate:
+    MAX_LEN = 150  # excluding extension
+
+    _PLACEHOLDER_RE = re.compile(r"\{(\w+)\}")
+    _GROUP_RE = re.compile(r"\[([^\[\]]*)\]")
+
+    @staticmethod
+    def format_date(value: str, date_format: str) -> str:
+        """Reformat an ISO 'YYYY-MM-DD' date string per `date_format`
+        (e.g. "%m-%d-%y" -> "07-15-26"). If `value` isn't a parseable ISO
+        date, it's returned verbatim — never dropped just because it
+        doesn't match the expected shape. Empty input returns ""."""
+        value = (value or "").strip()
+        if not value:
+            return ""
+        try:
+            dt = datetime.datetime.strptime(value, "%Y-%m-%d")
+            return dt.strftime(date_format)
+        except (ValueError, TypeError):
+            return value
+
+    @classmethod
+    def _render_group(cls, body: str, fields: dict) -> str:
+        placeholders = cls._PLACEHOLDER_RE.findall(body)
+        if placeholders and any(not fields.get(p) for p in placeholders):
+            return ""
+        return cls._PLACEHOLDER_RE.sub(lambda m: fields.get(m.group(1), ""), body)
+
+    @classmethod
+    def render(cls, template: str, fields: dict) -> str:
+        """Render `template` against `fields` (any key not present is
+        treated as an empty string). See module-level docstring for the
+        template language. Collapses whitespace and strips separators
+        ("-", spaces) a dropped group can leave dangling at either end or
+        doubled in the middle."""
+        safe_fields = {k: (v or "") for k, v in (fields or {}).items()}
+
+        rendered = cls._GROUP_RE.sub(lambda m: cls._render_group(m.group(1), safe_fields), template)
+        rendered = cls._PLACEHOLDER_RE.sub(lambda m: safe_fields.get(m.group(1), ""), rendered)
+
+        rendered = re.sub(r"\s+", " ", rendered).strip()
+        rendered = re.sub(r"\s*-\s*-\s*", " - ", rendered)   # a dropped middle group can leave "X -  - Y"
+        rendered = re.sub(r"^[\s\-]+", "", rendered)
+        rendered = re.sub(r"[\s\-.]+$", "", rendered)        # trailing "-"/"." is unsafe on Windows anyway
+        return rendered
+
+    @classmethod
+    def build(cls, template: str, fields: dict, max_len: int = MAX_LEN) -> str:
+        """render() plus illegal-character sanitation and a length guard.
+
+        Sanitizes for illegal filesystem characters the same way
+        FileProcessor._safe_subject does, but deliberately does NOT
+        title-case the result — the {client} segment is already
+        "LAST, First" and must keep its exact capitalization and comma.
+
+        If the rendered name would exceed `max_len` characters (excluding
+        extension), the doc_type field is shortened first, then recipient,
+        and the truncation is logged. A hard character-count truncation is
+        the last resort if that still isn't enough, so this never returns
+        something that could fail to write on Windows.
+        """
+        def _sanitize(text: str) -> str:
+            text = ILLEGAL_CHARS_RE.sub("", text)
+            return re.sub(r"\s+", " ", text).strip()
+
+        rendered = _sanitize(cls.render(template, fields))
+        if len(rendered) <= max_len:
+            return rendered
+
+        work_fields = dict(fields or {})
+        truncated = False
+        for key in ("doc_type", "recipient"):
+            if len(rendered) <= max_len:
+                break
+            value = work_fields.get(key) or ""
+            if not value:
+                continue
+            excess = len(rendered) - max_len
+            new_len = max(0, len(value) - excess)
+            work_fields[key] = value[:new_len].rstrip()
+            truncated = True
+            rendered = _sanitize(cls.render(template, work_fields))
+
+        if len(rendered) > max_len:
+            rendered = rendered[:max_len].rstrip(" -.")
+            truncated = True
+
+        if truncated:
+            logging.info(
+                f"Filename template rendered over {max_len} chars — truncated to fit: '{rendered}'"
+            )
+        return rendered
+
+
+# ─────────────────────────────────────────────────────────────
 # FileProcessor
 # ─────────────────────────────────────────────────────────────
 
@@ -2515,13 +2645,14 @@ class FileProcessor:
         ext = os.path.splitext(filename)[1].lower()
         proc_cfg = config["processing"]
         safety_cfg = config.get("safety", {})
+        naming_cfg = config.get("naming", {})
         dry_run = config.get("automation", {}).get("dry_run", False)
         if reserved is None:
             reserved = set()
 
         # Skip already-processed files
         if proc_cfg.get("skip_already_processed") and \
-                FileProcessor._already_processed(filename, client_list):
+                FileProcessor._already_processed(filename, client_list, naming_cfg):
             return ProcessResult(
                 original_name=filename,
                 final_name=filename,
@@ -2778,14 +2909,25 @@ class FileProcessor:
                 final_client = matched
                 status = "renamed"
             else:
-                final_client = "A-NEEDS REVIEW"
+                # Two distinct unresolved states (naming.split_unknown_states):
+                #   A-UNKNOWN CLIENT — a person's name WAS read but doesn't
+                #     match the client list (the "George was a passenger in
+                #     Mary's accident" case; Pass 6 will learn these).
+                #   A-NEEDS REVIEW — no person name could be read at all, or
+                #     the model returned NEEDS_REVIEW / parsing failed.
+                # Both keep the "A-" prefix so they sort to the top of an
+                # alphabetical folder listing. When the flag is off, both
+                # cases collapse to no_client_label exactly as today.
+                if naming_cfg.get("split_unknown_states", False) \
+                        and FileProcessor._looks_like_person_name(raw_client):
+                    final_client = naming_cfg.get("unknown_client_label", "A-UNKNOWN CLIENT")
+                else:
+                    final_client = naming_cfg.get("no_client_label", "A-NEEDS REVIEW")
                 status = "needs_review"
 
-            # Naming templates are a later pass (PASS 5) — filename construction
-            # itself (final_client + " - " + safe_desc) is unchanged here. The
-            # only PASS 4 change is which text feeds safe_desc: the model's own
-            # printed doc_type when structured_output is on, the free-form desc
-            # otherwise (today's exact behavior).
+            # Which text feeds the description / {doc_type} placeholder: the
+            # model's own printed doc_type when structured_output is on, the
+            # free-form desc otherwise (today's exact behavior either way).
             if cls_cfg.get("structured_output", False) and final_doc_type:
                 safe_desc = FileProcessor._safe_subject(final_doc_type) or "Document"
             else:
@@ -2800,14 +2942,71 @@ class FileProcessor:
                 )
                 safe_desc = "Incoming Document"
 
-            new_name = f"{final_client} - {safe_desc}{ext}"
+            # ── Filename construction (naming.use_templates) ──────────────
+            # Off (default): byte-for-byte today's construction. On: render
+            # via the per-doc-type template — recipient/date segments are
+            # further gated by naming.include_recipient/include_doc_date so
+            # a document's fields can be extracted without appearing in the
+            # name unless the office has actually turned that on.
+            if naming_cfg.get("use_templates", False):
+                doc_type_display = FileProcessor._safe_subject(final_doc_type) if final_doc_type else safe_desc
+                if not doc_type_display:
+                    doc_type_display = "Document"
+                if FileProcessor._desc_is_fax(doc_type_display):
+                    doc_type_display = "Incoming Document"
+
+                recipient_display = ""
+                if naming_cfg.get("include_recipient", False) and final_recipient:
+                    recipient_display = FileProcessor._safe_subject(final_recipient)
+
+                doc_date_source = raw_doc_date or identifiers.get("date_of_injury", "")
+                doc_date_display = ""
+                if naming_cfg.get("include_doc_date", False) and doc_date_source:
+                    doc_date_display = NameTemplate.format_date(
+                        doc_date_source, naming_cfg.get("date_format", "%m-%d-%y")
+                    )
+
+                template_fields = {
+                    "client": final_client,
+                    "doc_type": doc_type_display,
+                    "recipient": recipient_display,
+                    "doc_date": doc_date_display,
+                    "claim_number": identifiers.get("claim_number", ""),
+                    "direction": direction,
+                }
+                templates_map = naming_cfg.get("templates") or {}
+                template_str = (
+                    templates_map.get(final_doc_type)
+                    or naming_cfg.get("default_template")
+                    or "{client} - {doc_type}"
+                )
+                stem = NameTemplate.build(template_str, template_fields)
+                if not stem:
+                    stem = f"{final_client} - {doc_type_display}".strip(" -")
+                new_name = f"{stem}{ext}"
+            else:
+                new_name = f"{final_client} - {safe_desc}{ext}"
 
             # Collision avoidance. `reserved` also carries names already
             # claimed earlier in this batch — needed in dry-run, where
             # nothing actually lands on disk, so two documents that would
             # both become the same name must still preview as distinct.
+            # naming.date_disambiguation: before falling back to a bare
+            # "(1)"/"(2)" counter, try appending the document date, then the
+            # claim number — a far more informative disambiguator than a
+            # meaningless index for the office's alphabetical listing.
             dest_dir = os.path.dirname(file_path)
-            new_name = FileProcessor._resolve_collision(dest_dir, new_name, filename, reserved=reserved)
+            collision_extra = None
+            if naming_cfg.get("date_disambiguation", False):
+                collision_extra = {
+                    "date_disambiguation": True,
+                    "doc_date": raw_doc_date or identifiers.get("date_of_injury", ""),
+                    "claim_number": identifiers.get("claim_number", ""),
+                    "date_format": naming_cfg.get("date_format", "%m-%d-%y"),
+                }
+            new_name = FileProcessor._resolve_collision(
+                dest_dir, new_name, filename, reserved=reserved, extra=collision_extra
+            )
             reserved.add(new_name)
 
             renamed_at = None
@@ -2837,7 +3036,7 @@ class FileProcessor:
                 # that now looks "already processed") in the time between
                 # our first check and now.
                 if proc_cfg.get("skip_already_processed") and \
-                        FileProcessor._already_processed(filename, client_list):
+                        FileProcessor._already_processed(filename, client_list, naming_cfg):
                     return ProcessResult(
                         original_name=filename,
                         final_name=filename,
@@ -3091,16 +3290,26 @@ class FileProcessor:
 
     @staticmethod
     def _resolve_collision(directory: str, filename: str, source_name: str,
-                            reserved: Optional[set] = None) -> str:
+                            reserved: Optional[set] = None,
+                            extra: Optional[dict] = None) -> str:
         """If `filename` already exists in `directory` (and isn't the source
-        file) OR has already been claimed via `reserved`, append (1), (2), …
-        until a free name is found.
+        file) OR has already been claimed via `reserved`, find a free name.
 
         `reserved` lets a batch track names it has already handed out to
         earlier files without relying on the filesystem — essential in
         dry-run mode, where nothing is actually written to disk, so two
         documents that would both become the same name must still preview
-        as distinct."""
+        as distinct.
+
+        `extra` (naming.date_disambiguation) — when given with
+        `extra["date_disambiguation"]` truthy, informative disambiguators
+        are tried before the bare "(1)", "(2)", … counter: first the
+        document date (`extra["doc_date"]`, formatted per
+        `extra["date_format"]`), then the claim number
+        (`extra["claim_number"]`). Either may be absent or fail to help —
+        this always falls through to the counter as a last resort. `extra`
+        is optional and defaults to None so call sites without these
+        fields (e.g. the audit-mode rename) are unaffected."""
         if filename == source_name:
             return filename
 
@@ -3113,6 +3322,24 @@ class FileProcessor:
         if not _taken(filename):
             return filename
         base, ext = os.path.splitext(filename)
+
+        if extra and extra.get("date_disambiguation"):
+            doc_date = (extra.get("doc_date") or "").strip()
+            if doc_date:
+                formatted = NameTemplate.format_date(doc_date, extra.get("date_format") or "%m-%d-%y")
+                formatted = ILLEGAL_CHARS_RE.sub("", formatted).strip()
+                if formatted:
+                    candidate = f"{base} {formatted}{ext}"
+                    if not _taken(candidate):
+                        return candidate
+            claim_number = (extra.get("claim_number") or "").strip()
+            if claim_number:
+                claim_clean = ILLEGAL_CHARS_RE.sub("", claim_number).strip()
+                if claim_clean:
+                    candidate = f"{base} {claim_clean}{ext}"
+                    if not _taken(candidate):
+                        return candidate
+
         counter = 1
         while True:
             candidate = f"{base} ({counter}){ext}"
@@ -3165,11 +3392,46 @@ class FileProcessor:
         except Exception:
             return ""
 
+    # Sentinel values the model can return (or _parse_response can fall back
+    # to) meaning "no usable person name" — never a plausible client name.
+    _CLIENT_SENTINELS = frozenset({"", "NEEDS_REVIEW", "A-NEEDS REVIEW", "A-UNKNOWN CLIENT"})
+
     @staticmethod
-    def _already_processed(filename: str, client_list: list) -> bool:
+    def _looks_like_person_name(raw_client: str) -> bool:
+        """True if `raw_client` plausibly holds a person's name — non-empty,
+        not one of the model's own NEEDS_REVIEW-style sentinels, and made up
+        of at least two name-like tokens (e.g. "SMITH, John" or "John
+        Smith"). Used by naming.split_unknown_states to tell apart
+        A-UNKNOWN CLIENT (a name was read but isn't on the client list —
+        the "George was a passenger in Mary's accident" case) from
+        A-NEEDS REVIEW (no name could be read at all)."""
+        if not raw_client:
+            return False
+        stripped = raw_client.strip()
+        if stripped.upper() in FileProcessor._CLIENT_SENTINELS:
+            return False
+        tokens = [t for t in re.split(r"[,\s]+", stripped) if t]
+        name_tokens = [t for t in tokens if re.match(r"^[A-Za-z][A-Za-z'\-]*\.?$", t)]
+        return len(name_tokens) >= 2
+
+    @staticmethod
+    def _already_processed(filename: str, client_list: list,
+                            naming_cfg: Optional[dict] = None) -> bool:
         """True if the file already looks like 'LAST, First - Subject.ext'
-        with a recognised client name at the front."""
-        if filename.startswith("A-NEEDS REVIEW"):
+        with a recognised client name at the front.
+
+        Short-circuits to False for either of the two "unresolved" labels
+        this tool can produce — A-NEEDS REVIEW (no name could be read) and
+        A-UNKNOWN CLIENT (a name was read but isn't on the client list,
+        naming.split_unknown_states) — so files carrying either one are
+        never mistaken for already-named and silently skipped forever.
+        `naming_cfg` (config["naming"]) lets a caller honor customized
+        label text; the two default labels are always checked either way."""
+        labels = {"A-NEEDS REVIEW", "A-UNKNOWN CLIENT"}
+        if naming_cfg:
+            labels.add(naming_cfg.get("no_client_label", "A-NEEDS REVIEW"))
+            labels.add(naming_cfg.get("unknown_client_label", "A-UNKNOWN CLIENT"))
+        if any(lbl and filename.startswith(lbl) for lbl in labels):
             return False
         match = re.match(r"^(.+?) - .+\.(pdf|jpg|jpeg)$", filename, re.IGNORECASE)
         if not match:
@@ -3285,7 +3547,7 @@ class ProcessingEngine:
                         stragglers = [
                             f for f in stragglers
                             if not (config["processing"].get("skip_already_processed")
-                                    and FileProcessor._already_processed(f, client_list))
+                                    and FileProcessor._already_processed(f, client_list, config.get("naming", {})))
                         ]
                     except Exception as e:
                         logging.warning(f"Straggler sweep could not list folder: {e}")
@@ -3899,7 +4161,7 @@ class ScandocsApp(ttk.Window):
                 f for f in os.listdir(scandocs)
                 if os.path.isfile(os.path.join(scandocs, f))
                 and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
-                and not FileProcessor._already_processed(f, client_list)
+                and not FileProcessor._already_processed(f, client_list, self.config_mgr.config.get("naming", {}))
             ]
         except OSError as e:
             self.unnamed_count_var.set(f"Could not read scandocs folder: {e}")
@@ -5178,7 +5440,7 @@ class ScandocsApp(ttk.Window):
                 f for f in os.listdir(scandocs)
                 if os.path.isfile(os.path.join(scandocs, f))
                 and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
-                and not FileProcessor._already_processed(f, self._all_clients)
+                and not FileProcessor._already_processed(f, self._all_clients, self.config_mgr.config.get("naming", {}))
             )
             for f in review_files:
                 self.review_listbox.insert(tk.END, f)
@@ -6597,7 +6859,8 @@ class ScandocsApp(ttk.Window):
 
         # Which part changes?
         client_bad = result.audit_wrong_client or result.audit_failed_client or result.audit_should_review
-        new_client = "A-NEEDS REVIEW" if client_bad else orig_client
+        no_client_label = self.config_mgr.config.get("naming", {}).get("no_client_label", "A-NEEDS REVIEW")
+        new_client = no_client_label if client_bad else orig_client
         new_desc   = "Scanned Document" if result.audit_bad_description else orig_desc
 
         proposed = f"{new_client} - {new_desc}{ext}" if new_desc else f"{new_client}{ext}"
@@ -7005,7 +7268,8 @@ class ScandocsApp(ttk.Window):
             old_client = m.group(1) if m else base
             old_desc   = m.group(2) if m else ""
 
-            new_client = "A-NEEDS REVIEW" if result.audit_wrong_client else old_client
+            no_client_label = self.config_mgr.config.get("naming", {}).get("no_client_label", "A-NEEDS REVIEW")
+            new_client = no_client_label if result.audit_wrong_client else old_client
             new_desc   = "Scanned Document" if result.audit_bad_description else old_desc
 
             new_name = f"{new_client} - {new_desc}{ext}" if old_desc else f"{new_client}{ext}"
