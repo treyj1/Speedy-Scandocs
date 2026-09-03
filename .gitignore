@@ -45,3 +45,14 @@ Desktop.ini
 tools/benchmark_data/
 tools/*.csv
 benchmark_results*.csv
+
+# Learning store — real corrected client names and document text excerpts,
+# generated locally as the app is used. Never bundled, never committed.
+corrections.jsonl
+learning_index.json
+renames.jsonl
+.speedyscandocs.lock
+
+# Locally-grown vocabularies — evolve per install, not repo assets
+document_types.txt
+providers.txt
