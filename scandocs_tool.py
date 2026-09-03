@@ -1109,6 +1109,9 @@ class ClientListManager:
 
 class DocumentTypeManager:
 
+    # Minimum alias length eligible for whole-word containment matching.
+    _CONTAINMENT_MIN_LEN = 10
+
     @staticmethod
     def _seed_if_missing(path: str) -> None:
         """Write DEFAULT_DOCUMENT_TYPES to `path` if nothing is there yet —
@@ -1207,6 +1210,23 @@ class DocumentTypeManager:
             return ""
         if raw_norm in alias_map:
             return alias_map[raw_norm]
+
+        # Containment pass — the model often returns the real title padded with
+        # extra description, e.g. "Compromise Offer Letter Medical Bill" or
+        # "Physician Chiropractor Progress Report Disability Certification".
+        # A whole-string fuzzy ratio scores those below threshold, so look for a
+        # known alias appearing as a whole-word substring. Longest match wins so
+        # "Physician Chiropractor Progress Report" beats the shorter, more
+        # generic "Progress Report". Keys under _CONTAINMENT_MIN_LEN are skipped
+        # so short ones like "Lien" or "PPR" can't match inside unrelated titles.
+        contained = [
+            key for key in alias_map
+            if len(key) >= DocumentTypeManager._CONTAINMENT_MIN_LEN
+            and re.search(r"\b" + re.escape(key) + r"\b", raw_norm)
+        ]
+        if contained:
+            return alias_map[max(contained, key=len)]
+
         best_key = None
         best_score = 0.0
         for key in alias_map:
