@@ -275,6 +275,8 @@ DEFAULT_CONFIG: dict = {
         "skip_already_processed": True,
         "audit_mode": True,
         "file_mode": False,
+        "file_mode_auto": True,     # enable File Mode's panel on the Process tab
+        "file_mode_manual": True,   # enable File Mode's panel on the Manual Correction panel
         "file_mode_destination": "",
         "suggest_location_enabled": False,
         "suggest_location_parent_folder": "",
@@ -439,6 +441,89 @@ def model_supports_vision(model_name: str) -> bool:
     if any(excl in name for excl in VISION_MODEL_EXCLUSIONS):
         return False
     return any(prefix in name for prefix in VISION_MODEL_PREFIXES)
+
+
+# ─────────────────────────────────────────────────────────────
+# Settings tab — display <-> config mapping and dependency logic (PASS 7)
+# ─────────────────────────────────────────────────────────────
+# Pure functions, deliberately free of any tkinter/UI dependency so they
+# can be unit-tested on their own. The Settings tab calls these; nothing
+# else in the app should need to.
+
+LEARNING_MODE_CONFIG_TO_DISPLAY = {
+    "off": "Off", "suggest": "Suggest only", "auto": "Automatic",
+}
+LEARNING_MODE_DISPLAY_TO_CONFIG = {
+    v: k for k, v in LEARNING_MODE_CONFIG_TO_DISPLAY.items()
+}
+LEARNING_MODE_VALUES = list(LEARNING_MODE_CONFIG_TO_DISPLAY.values())
+
+
+def learning_mode_to_display(value: str) -> str:
+    """Config string ("off"/"suggest"/"auto") -> combobox display string.
+    An unrecognized or legacy value falls back to "Off" rather than
+    raising, so a hand-edited config.json can never crash the UI."""
+    return LEARNING_MODE_CONFIG_TO_DISPLAY.get((value or "").strip().lower(), "Off")
+
+
+def learning_mode_to_config(display: str) -> str:
+    """Combobox display string -> config string. An unrecognized display
+    value (shouldn't happen from the UI itself) falls back to "off"."""
+    return LEARNING_MODE_DISPLAY_TO_CONFIG.get((display or "").strip(), "off")
+
+
+RETROACTIVE_MODE_CONFIG_TO_DISPLAY = {"off": "Off", "preview": "Preview only"}
+RETROACTIVE_MODE_DISPLAY_TO_CONFIG = {
+    v: k for k, v in RETROACTIVE_MODE_CONFIG_TO_DISPLAY.items()
+}
+RETROACTIVE_MODE_VALUES = list(RETROACTIVE_MODE_CONFIG_TO_DISPLAY.values())
+
+
+def retroactive_mode_to_display(value: str) -> str:
+    """Only two states exist here on purpose — there is no "Automatic":
+    a law firm must never have files renamed with no human in the loop."""
+    return RETROACTIVE_MODE_CONFIG_TO_DISPLAY.get((value or "").strip().lower(), "Off")
+
+
+def retroactive_mode_to_config(display: str) -> str:
+    return RETROACTIVE_MODE_DISPLAY_TO_CONFIG.get((display or "").strip(), "off")
+
+
+def compute_settings_dependency_state(cfg: dict) -> dict:
+    """Given a config dict, return which dependent Settings controls should
+    be disabled right now, and why.
+
+    Returns {dependency_key: (disabled: bool, reason: str)} — `reason` is
+    "" whenever disabled is False. Keys match the setting each gates:
+      "classification.use_document_types"  requires structured_output
+      "classification.use_providers"       requires structured_output
+      "classification.extract_recipient"   requires structured_output
+      "naming.include_recipient"           requires classification.extract_recipient
+      "reading.vision_escalation"          requires a vision-capable model
+    """
+    classification = (cfg or {}).get("classification", {}) or {}
+    api = (cfg or {}).get("api", {}) or {}
+    structured_on = bool(classification.get("structured_output", False))
+    extract_recipient_on = bool(classification.get("extract_recipient", False))
+    model = (api.get("model") or "").strip()
+    vision_ok = model_supports_vision(model)
+
+    need_structured = "Turn on 'Ask the model for structured details' first"
+    need_recipient = "Turn on 'Identify who the document is going to' first"
+    if vision_ok:
+        vision_reason = ""
+    elif model:
+        vision_reason = f"Needs a vision-capable model — currently set to {model}"
+    else:
+        vision_reason = "Needs a vision-capable model — no model is set"
+
+    return {
+        "classification.use_document_types": (not structured_on, "" if structured_on else need_structured),
+        "classification.use_providers":      (not structured_on, "" if structured_on else need_structured),
+        "classification.extract_recipient":  (not structured_on, "" if structured_on else need_structured),
+        "naming.include_recipient":          (not extract_recipient_on, "" if extract_recipient_on else need_recipient),
+        "reading.vision_escalation":         (not vision_ok, vision_reason),
+    }
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1423,6 +1508,12 @@ class LearningStore:
             # a rebuild never silently forgets a decision a human already
             # made.
             "alias_decisions": {},
+            # Same idea for the Pass 7 Suggestions tab's doc-type/provider
+            # rows (accept_doc_type_candidate / reject_doc_type_candidate
+            # and their provider equivalents) — without this an "Ignore"
+            # click would just reappear on the next rebuild.
+            "doc_type_decisions": {},
+            "provider_decisions": {},
         }
 
     def _load_index(self) -> dict:
@@ -1670,6 +1761,8 @@ class LearningStore:
             "provider_candidates": provider_stats,
             "claim_index": claim_stats,
             "alias_decisions": decisions,
+            "doc_type_decisions": self.index.get("doc_type_decisions", {}),
+            "provider_decisions": self.index.get("provider_decisions", {}),
         }
         self._write_index()
         return self.index
@@ -1701,7 +1794,10 @@ class LearningStore:
                 "last_seen": rec.get("last_seen", ""),
             })
 
+        doc_type_decisions = self.index.get("doc_type_decisions", {})
         for norm, rec in self.index.get("doc_type_candidates", {}).items():
+            if norm in doc_type_decisions:
+                continue
             if rec.get("count", 0) >= self.observations_required:
                 examples = rec.get("examples", [])
                 out.append({
@@ -1711,7 +1807,10 @@ class LearningStore:
                     "examples": examples,
                 })
 
+        provider_decisions = self.index.get("provider_decisions", {})
         for norm, rec in self.index.get("provider_candidates", {}).items():
+            if norm in provider_decisions:
+                continue
             if rec.get("count", 0) >= self.observations_required:
                 examples = rec.get("examples", [])
                 out.append({
@@ -1744,6 +1843,51 @@ class LearningStore:
         self.index.setdefault("alias_decisions", {})[norm] = {
             "status": "rejected", "client": "",
             "raw_display": existing.get("raw_display", raw_name),
+        }
+        self.rebuild_index()
+
+    def accept_doc_type_candidate(self, name: str) -> None:
+        """Human accepted a suggested document type (Pass 7 Suggestions
+        tab). Marks it decided so it stops appearing as pending — the UI
+        is responsible for actually adding `name` to document_types.txt
+        via DocumentTypeManager."""
+        norm = self._normalize_name(name)
+        if not norm:
+            return
+        self.index.setdefault("doc_type_decisions", {})[norm] = {
+            "status": "accepted", "name": name,
+        }
+        self.rebuild_index()
+
+    def reject_doc_type_candidate(self, name: str) -> None:
+        """Human dismissed a suggested document type — permanently stops
+        it from reappearing in pending_suggestions()."""
+        norm = self._normalize_name(name)
+        if not norm:
+            return
+        self.index.setdefault("doc_type_decisions", {})[norm] = {
+            "status": "rejected", "name": name,
+        }
+        self.rebuild_index()
+
+    def accept_provider_candidate(self, name: str) -> None:
+        """Human accepted a suggested provider. Marks it decided; the UI
+        adds `name` to providers.txt via ProviderManager."""
+        norm = self._normalize_name(name)
+        if not norm:
+            return
+        self.index.setdefault("provider_decisions", {})[norm] = {
+            "status": "accepted", "name": name,
+        }
+        self.rebuild_index()
+
+    def reject_provider_candidate(self, name: str) -> None:
+        """Human dismissed a suggested provider."""
+        norm = self._normalize_name(name)
+        if not norm:
+            return
+        self.index.setdefault("provider_decisions", {})[norm] = {
+            "status": "rejected", "name": name,
         }
         self.rebuild_index()
 
@@ -4811,8 +4955,15 @@ class ScandocsApp(ttk.Window):
         self._build_process_tab()
         self._build_review_tab()   # legacy Manual Entry tab — attached/detached via Settings toggle
         self._build_clients_tab()
+        self._build_document_types_tab()
+        self._build_providers_tab()
+        self._build_suggestions_tab()
         self._build_settings_tab()
         self.notebook.bind("<<NotebookTabChanged>>", self._on_tab_changed)
+        # The Suggestions tab's label carries a pending-count badge, e.g.
+        # "  Suggestions (3)  " — refresh it once at startup too, not only
+        # on tab-change, so a badge is visible before it's ever opened.
+        self.after(500, self._refresh_suggestions_badge)
 
     def _on_tab_changed(self, _evt=None):
         # Refresh each tab when it becomes active so it always reflects the
@@ -4827,6 +4978,12 @@ class ScandocsApp(ttk.Window):
             self._refresh_review_tab()
         elif getattr(self, "_clients_tab", None) is current:
             self._refresh_client_list_tab()
+        elif getattr(self, "_doc_types_tab", None) is current:
+            self._refresh_document_types_tab()
+        elif getattr(self, "_providers_tab", None) is current:
+            self._refresh_providers_tab()
+        elif getattr(self, "_suggestions_tab", None) is current:
+            self._refresh_suggestions_tab()
 
     def _refresh_unnamed_count(self):
         """Count files in the scandocs folder that don't yet match the
@@ -4906,9 +5063,22 @@ class ScandocsApp(ttk.Window):
         # Accent bar
         tk.Frame(tab, bg=_APP_PRIMARY, height=6).pack(fill=tk.X)
 
+        # Preview-mode banner — hidden unless automation.dry_run is on.
+        # Not packed here; _apply_dry_run_banner() shows/hides it (with
+        # before=btn_row) so a preview run can never be mistaken for a real
+        # one, on top of the window-title indicator _start_processing sets.
+        self._preview_banner = tk.Frame(tab, bg="#fff3cd")
+        tk.Label(
+            self._preview_banner,
+            text="⚠  PREVIEW MODE — Settings has \"Preview mode\" turned on. "
+                 "No files will actually be renamed or moved.",
+            bg="#fff3cd", fg="#7a5b00", font=(APP_FONT, 10, "bold"),
+        ).pack(pady=5)
+
         # Button row
         btn_row = ttk.Frame(tab)
         btn_row.pack(fill=tk.X, padx=10, pady=(10, 4))
+        self._process_btn_row = btn_row
         self.btn_process = ttk.Button(
             btn_row, text="Auto-Process Documents", command=self._start_processing,
             bootstyle="primary",
@@ -4919,6 +5089,11 @@ class ScandocsApp(ttk.Window):
             state=tk.DISABLED, bootstyle="danger-outline",
         )
         self.btn_stop.pack(side=tk.LEFT)
+        self.btn_undo_batch = ttk.Button(
+            btn_row, text="Undo Last Rename Batch…", command=self._show_undo_dialog,
+            bootstyle="warning-outline",
+        )
+        self.btn_undo_batch.pack(side=tk.LEFT, padx=(6, 0))
         right_frame = ttk.Frame(btn_row)
         right_frame.pack(side=tk.RIGHT)
         self.btn_open_report = ttk.Button(
@@ -5426,12 +5601,476 @@ class ScandocsApp(ttk.Window):
         ttk.Label(save_frame, textvariable=self.client_status_var,
                   foreground="green").pack(side=tk.LEFT, padx=10)
 
+    # ── Tab: Document Types ────────────────────────────────────
+
+    def _build_document_types_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self._doc_types_tab = tab
+        self.notebook.add(tab, text="  Document Types  ")
+
+        ttk.Label(
+            tab,
+            text="Format on disk: Canonical Name | alias1 | alias2 …  "
+                 "(this list edits canonical names only — add or edit aliases directly "
+                 "in document_types.txt). Used when Settings → Understanding Documents → "
+                 "'Use the document type list' is on.",
+            foreground="gray", wraplength=760, justify="left",
+        ).pack(anchor="w", padx=10, pady=(10, 2))
+
+        list_frame = ttk.Frame(tab)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        self.doc_type_listbox = tk.Listbox(
+            list_frame, selectmode=tk.SINGLE, font=(APP_FONT, 10)
+        )
+        dt_sb = ttk.Scrollbar(list_frame, orient="vertical",
+                               command=self.doc_type_listbox.yview)
+        self.doc_type_listbox.configure(yscrollcommand=dt_sb.set)
+        dt_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.doc_type_listbox.pack(fill=tk.BOTH, expand=True)
+        _dt_scroll = lambda e: self.doc_type_listbox.yview_scroll(
+            -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units")
+        self._bind_mousewheel(self.doc_type_listbox, _dt_scroll)
+
+        edit_frame = ttk.Frame(tab)
+        edit_frame.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self.new_doc_type_var = tk.StringVar()
+        entry = ttk.Entry(edit_frame, textvariable=self.new_doc_type_var, width=32)
+        entry.pack(side=tk.LEFT, padx=(0, 6))
+        entry.bind("<Return>", lambda _: self._add_doc_type())
+        ttk.Button(edit_frame, text="Add Document Type", command=self._add_doc_type,
+                   bootstyle="primary-outline").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(edit_frame, text="Remove Selected", command=self._remove_doc_type,
+                   bootstyle="danger-outline").pack(side=tk.LEFT)
+
+        save_frame = ttk.Frame(tab)
+        save_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(save_frame, text="Save Document Types", command=self._save_document_types,
+                   bootstyle="primary").pack(side=tk.LEFT)
+        self.doc_type_status_var = tk.StringVar(value="")
+        ttk.Label(save_frame, textvariable=self.doc_type_status_var,
+                  foreground="green").pack(side=tk.LEFT, padx=10)
+
+    def _refresh_document_types_tab(self):
+        path = self.config_mgr.config["paths"].get("document_types_file", "")
+        names = DocumentTypeManager.load(path)
+        self.doc_type_listbox.delete(0, tk.END)
+        for n in sorted(names):
+            self.doc_type_listbox.insert(tk.END, n)
+
+    def _add_doc_type(self):
+        name = self.new_doc_type_var.get().strip()
+        if not name:
+            return
+        existing = list(self.doc_type_listbox.get(0, tk.END))
+        if name in existing:
+            messagebox.showinfo("Duplicate", f'"{name}" is already in the list.')
+            return
+        existing.append(name)
+        existing.sort()
+        self.doc_type_listbox.delete(0, tk.END)
+        for item in existing:
+            self.doc_type_listbox.insert(tk.END, item)
+        self.new_doc_type_var.set("")
+        self.doc_type_status_var.set("Unsaved changes")
+
+    def _remove_doc_type(self):
+        sel = self.doc_type_listbox.curselection()
+        if not sel:
+            return
+        name = self.doc_type_listbox.get(sel[0])
+        if messagebox.askyesno(
+            "Remove", f'Remove "{name}" from the list?\n\n'
+            "This only removes the canonical name shown here — if it had aliases in "
+            "document_types.txt, edit the file directly to remove those too.",
+        ):
+            self.doc_type_listbox.delete(sel[0])
+            self.doc_type_status_var.set("Unsaved changes")
+
+    def _save_document_types(self):
+        path = self.config_mgr.config["paths"].get("document_types_file", "")
+        if not path:
+            messagebox.showerror("No File", "No document types file is configured.")
+            return
+        names = list(self.doc_type_listbox.get(0, tk.END))
+        try:
+            DocumentTypeManager.save(path, names)
+            self.doc_type_status_var.set(f"Saved {len(names)} document types.")
+        except Exception as e:
+            messagebox.showerror("Save Failed", str(e))
+
+    # ── Tab: Providers ───────────────────────────────────────
+
+    def _build_providers_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self._providers_tab = tab
+        self.notebook.add(tab, text="  Providers  ")
+
+        ttk.Label(
+            tab,
+            text="Facilities, clinics, hospitals, insurers — one per line in providers.txt. "
+                 "Used when Settings → Understanding Documents → 'Use the provider list' is on.",
+            foreground="gray", wraplength=760, justify="left",
+        ).pack(anchor="w", padx=10, pady=(10, 2))
+
+        list_frame = ttk.Frame(tab)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=4)
+        self.provider_listbox = tk.Listbox(
+            list_frame, selectmode=tk.SINGLE, font=(APP_FONT, 10)
+        )
+        pr_sb = ttk.Scrollbar(list_frame, orient="vertical",
+                               command=self.provider_listbox.yview)
+        self.provider_listbox.configure(yscrollcommand=pr_sb.set)
+        pr_sb.pack(side=tk.RIGHT, fill=tk.Y)
+        self.provider_listbox.pack(fill=tk.BOTH, expand=True)
+        _pr_scroll = lambda e: self.provider_listbox.yview_scroll(
+            -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units")
+        self._bind_mousewheel(self.provider_listbox, _pr_scroll)
+
+        edit_frame = ttk.Frame(tab)
+        edit_frame.pack(fill=tk.X, padx=10, pady=(0, 2))
+        self.new_provider_var = tk.StringVar()
+        entry = ttk.Entry(edit_frame, textvariable=self.new_provider_var, width=32)
+        entry.pack(side=tk.LEFT, padx=(0, 6))
+        entry.bind("<Return>", lambda _: self._add_provider())
+        ttk.Button(edit_frame, text="Add Provider", command=self._add_provider,
+                   bootstyle="primary-outline").pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(edit_frame, text="Remove Selected", command=self._remove_provider,
+                   bootstyle="danger-outline").pack(side=tk.LEFT)
+
+        save_frame = ttk.Frame(tab)
+        save_frame.pack(fill=tk.X, padx=10, pady=(0, 10))
+        ttk.Button(save_frame, text="Save Providers", command=self._save_providers,
+                   bootstyle="primary").pack(side=tk.LEFT)
+        self.provider_status_var = tk.StringVar(value="")
+        ttk.Label(save_frame, textvariable=self.provider_status_var,
+                  foreground="green").pack(side=tk.LEFT, padx=10)
+
+    def _refresh_providers_tab(self):
+        path = self.config_mgr.config["paths"].get("providers_file", "")
+        names = ProviderManager.load(path)
+        self.provider_listbox.delete(0, tk.END)
+        for n in sorted(names):
+            self.provider_listbox.insert(tk.END, n)
+
+    def _add_provider(self):
+        name = self.new_provider_var.get().strip()
+        if not name:
+            return
+        existing = list(self.provider_listbox.get(0, tk.END))
+        if name in existing:
+            messagebox.showinfo("Duplicate", f'"{name}" is already in the list.')
+            return
+        existing.append(name)
+        existing.sort()
+        self.provider_listbox.delete(0, tk.END)
+        for item in existing:
+            self.provider_listbox.insert(tk.END, item)
+        self.new_provider_var.set("")
+        self.provider_status_var.set("Unsaved changes")
+
+    def _remove_provider(self):
+        sel = self.provider_listbox.curselection()
+        if not sel:
+            return
+        name = self.provider_listbox.get(sel[0])
+        if messagebox.askyesno("Remove", f'Remove "{name}" from the list?'):
+            self.provider_listbox.delete(sel[0])
+            self.provider_status_var.set("Unsaved changes")
+
+    def _save_providers(self):
+        path = self.config_mgr.config["paths"].get("providers_file", "")
+        if not path:
+            messagebox.showerror("No File", "No providers file is configured.")
+            return
+        names = list(self.provider_listbox.get(0, tk.END))
+        try:
+            ProviderManager.save(path, names)
+            self.provider_status_var.set(f"Saved {len(names)} providers.")
+        except Exception as e:
+            messagebox.showerror("Save Failed", str(e))
+
+    # ── Tab: Suggestions ─────────────────────────────────────
+    # Reads LearningStore.pending_suggestions() — client-relationship
+    # (alias), document-type, and provider candidates that have cleared
+    # their observation-count guard but haven't been confirmed or
+    # dismissed by a human yet. Accept/Ignore call the corresponding
+    # LearningStore methods (see LearningStore §"suggestions / decisions").
+
+    def _build_suggestions_tab(self):
+        tab = ttk.Frame(self.notebook)
+        self._suggestions_tab = tab
+        self.notebook.add(tab, text="  Suggestions  ")
+
+        ttk.Label(
+            tab,
+            text="Things the tool has noticed while processing documents and would like "
+                 "you to confirm. Nothing here has been applied yet.",
+            foreground="gray", wraplength=760, justify="left",
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+
+        _scroll_canvas = tk.Canvas(tab, highlightthickness=0)
+        _vsb = ttk.Scrollbar(tab, orient="vertical", command=_scroll_canvas.yview)
+        _scroll_canvas.configure(yscrollcommand=_vsb.set)
+        _vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        _scroll_canvas.pack(fill=tk.BOTH, expand=True, padx=10, pady=(0, 10))
+
+        inner = ttk.Frame(_scroll_canvas)
+        _win_id = _scroll_canvas.create_window((0, 0), window=inner, anchor="nw")
+
+        def _on_inner_configure(e):
+            _scroll_canvas.configure(scrollregion=_scroll_canvas.bbox("all"))
+        inner.bind("<Configure>", _on_inner_configure)
+
+        def _on_canvas_configure(e):
+            _scroll_canvas.itemconfig(_win_id, width=e.width)
+        _scroll_canvas.bind("<Configure>", _on_canvas_configure)
+
+        def _on_mousewheel(e):
+            _scroll_canvas.yview_scroll(
+                -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units")
+        self.after(200, lambda: ScandocsApp._bind_mousewheel(tab, _on_mousewheel))
+
+        self._suggestions_inner = inner
+
+    def _refresh_suggestions_tab(self):
+        if not hasattr(self, "_suggestions_inner"):
+            return
+        for child in self._suggestions_inner.winfo_children():
+            child.destroy()
+        try:
+            store = _get_learning_store(self.config_mgr.config)
+            suggestions = store.pending_suggestions()
+        except Exception as e:
+            logging.warning(f"Could not load suggestions: {e}")
+            suggestions = []
+        self._refresh_suggestions_badge(len(suggestions))
+        if not suggestions:
+            ttk.Label(
+                self._suggestions_inner, text="No pending suggestions right now.",
+                foreground="gray",
+            ).pack(anchor="w", padx=8, pady=20)
+            return
+        for s in suggestions:
+            self._build_suggestion_row(self._suggestions_inner, s, store)
+
+    def _refresh_suggestions_badge(self, count: Optional[int] = None):
+        """Put a pending-item count on the Suggestions tab label, e.g.
+        '  Suggestions (3)  '. Called on tab-change (via _refresh_suggestions_tab)
+        and once at startup so the badge is visible before the tab is ever opened."""
+        if not hasattr(self, "_suggestions_tab"):
+            return
+        if count is None:
+            try:
+                store = _get_learning_store(self.config_mgr.config)
+                count = len(store.pending_suggestions())
+            except Exception:
+                count = 0
+        label = f"  Suggestions ({count})  " if count else "  Suggestions  "
+        try:
+            self.notebook.tab(self._suggestions_tab, text=label)
+        except tk.TclError:
+            pass
+
+    def _build_suggestion_row(self, parent, s: dict, store: "LearningStore"):
+        kind = s.get("kind")
+        row = ttk.Frame(parent, padding=(8, 10))
+        row.pack(fill=tk.X)
+        ttk.Separator(parent, orient="horizontal").pack(fill=tk.X)
+
+        if kind == "alias":
+            text = (
+                f'File documents for "{s.get("raw_name", "")}" under '
+                f'"{s.get("resolved_client", "")}"?  '
+                f'(seen in {s.get("observations", 0)} documents)'
+            )
+            accept_cmd = lambda: self._accept_alias_suggestion(s, store)
+            reject_cmd = lambda: self._reject_alias_suggestion(s, store)
+        elif kind == "doc_type":
+            text = (f'Add "{s.get("name", "")}" to the Document Types list?  '
+                    f'(seen {s.get("count", 0)} times)')
+            accept_cmd = lambda: self._accept_doc_type_suggestion(s, store)
+            reject_cmd = lambda: self._reject_doc_type_suggestion(s, store)
+        elif kind == "provider":
+            text = (f'Add "{s.get("name", "")}" to the Providers list?  '
+                    f'(seen {s.get("count", 0)} times)')
+            accept_cmd = lambda: self._accept_provider_suggestion(s, store)
+            reject_cmd = lambda: self._reject_provider_suggestion(s, store)
+        else:
+            return
+
+        ttk.Label(row, text=text, wraplength=720, justify="left",
+                  font=(APP_FONT, 10)).pack(anchor="w")
+        btns = ttk.Frame(row)
+        btns.pack(anchor="w", pady=(6, 0))
+        ttk.Button(btns, text="Accept", bootstyle="success",
+                   command=accept_cmd).pack(side=tk.LEFT, padx=(0, 6))
+        ttk.Button(btns, text="Ignore", bootstyle="secondary-outline",
+                   command=reject_cmd).pack(side=tk.LEFT)
+
+    def _accept_alias_suggestion(self, s: dict, store: "LearningStore"):
+        raw_name = s.get("raw_name", "")
+        client = s.get("resolved_client", "")
+        store.confirm_alias(raw_name, client)
+        if self.config_mgr.config.get("learning", {}).get("retroactive_rename") == "preview":
+            scandocs = self.config_mgr.config["paths"].get("scandocs_folder", "")
+            folders = [scandocs] if scandocs else []
+            try:
+                proposals = store.plan_retroactive_renames(raw_name, client, folders)
+            except Exception as e:
+                logging.warning(f"plan_retroactive_renames failed: {e}")
+                proposals = []
+            if proposals:
+                self._show_retroactive_rename_preview(proposals)
+        self._refresh_suggestions_tab()
+
+    def _reject_alias_suggestion(self, s: dict, store: "LearningStore"):
+        store.reject_alias(s.get("raw_name", ""))
+        self._refresh_suggestions_tab()
+
+    def _accept_doc_type_suggestion(self, s: dict, store: "LearningStore"):
+        name = s.get("name", "")
+        path = self.config_mgr.config["paths"].get("document_types_file", "")
+        if name and path:
+            names = DocumentTypeManager.load(path)
+            if name not in names:
+                names.append(name)
+                DocumentTypeManager.save(path, names)
+        store.accept_doc_type_candidate(name)
+        self._refresh_suggestions_tab()
+        if getattr(self, "_doc_types_tab", None) is not None:
+            self._refresh_document_types_tab()
+
+    def _reject_doc_type_suggestion(self, s: dict, store: "LearningStore"):
+        store.reject_doc_type_candidate(s.get("name", ""))
+        self._refresh_suggestions_tab()
+
+    def _accept_provider_suggestion(self, s: dict, store: "LearningStore"):
+        name = s.get("name", "")
+        path = self.config_mgr.config["paths"].get("providers_file", "")
+        if name and path:
+            names = ProviderManager.load(path)
+            if name not in names:
+                names.append(name)
+                ProviderManager.save(path, names)
+        store.accept_provider_candidate(name)
+        self._refresh_suggestions_tab()
+        if getattr(self, "_providers_tab", None) is not None:
+            self._refresh_providers_tab()
+
+    def _reject_provider_suggestion(self, s: dict, store: "LearningStore"):
+        store.reject_provider_candidate(s.get("name", ""))
+        self._refresh_suggestions_tab()
+
+    # ── Retroactive rename preview (Pass 7 §3) ────────────────
+
+    def _show_retroactive_rename_preview(self, proposals: list):
+        """Scrollable checklist of current->proposed renames for files that
+        used a raw guess now resolved by a confirmed client relationship.
+        Everything is checked by default. Applying routes every rename
+        through log_rename so it's undoable via 'Undo Last Rename Batch…',
+        and honors automation.dry_run like every other rename in the app."""
+        dlg = tk.Toplevel(self)
+        dlg.title("Retroactive Rename Preview")
+        dlg.resizable(True, True)
+        dlg.transient(self)
+        dlg.grab_set()
+        self.update_idletasks()
+        w, h = 640, 480
+        x = self.winfo_x() + (self.winfo_width() - w) // 2
+        y = self.winfo_y() + (self.winfo_height() - h) // 2
+        dlg.geometry(f"{w}x{h}+{x}+{y}")
+
+        ttk.Label(
+            dlg,
+            text=f"{len(proposals)} file(s) matched this raw name. Everything is checked "
+                 "by default — uncheck any you don't want renamed.",
+            font=(APP_FONT, 10), wraplength=600, justify="left",
+        ).pack(anchor="w", padx=16, pady=(16, 8))
+
+        list_frame = ttk.Frame(dlg)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        canvas = tk.Canvas(list_frame, highlightthickness=0)
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        canvas.pack(fill=tk.BOTH, expand=True)
+        inner = ttk.Frame(canvas)
+        win_id = canvas.create_window((0, 0), window=inner, anchor="nw")
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win_id, width=e.width))
+        self._bind_mousewheel(canvas, lambda e: canvas.yview_scroll(
+            -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units"))
+
+        check_vars = []
+        for p in proposals:
+            var = tk.BooleanVar(value=True)
+            check_vars.append(var)
+            ttk.Checkbutton(
+                inner, variable=var,
+                text=f'{p["current_name"]}  →  {p["proposed_name"]}',
+            ).pack(anchor="w", padx=4, pady=2)
+
+        def _apply_selected():
+            dry_run = self.config_mgr.config.get("automation", {}).get("dry_run", False)
+            batch_id = "retro-" + datetime.datetime.now().strftime("%Y%m%d%H%M%S")
+            applied, skipped, errors = 0, 0, []
+            for p, var in zip(proposals, check_vars):
+                if not var.get():
+                    continue
+                src = p["path"]
+                dst = os.path.join(os.path.dirname(src), p["proposed_name"])
+                if not os.path.isfile(src):
+                    skipped += 1
+                    continue
+                if os.path.exists(dst):
+                    skipped += 1
+                    errors.append(f'{p["current_name"]}: a file already exists at the new name')
+                    continue
+                if dry_run:
+                    applied += 1
+                    continue
+                try:
+                    os.rename(src, dst)
+                    log_rename(batch_id, "rename", src, dst, "correction")
+                    applied += 1
+                except Exception as ex:
+                    errors.append(f'{p["current_name"]}: {ex}')
+            msg = f"Applied: {applied}\nSkipped: {skipped}"
+            if dry_run:
+                msg += "\n\n(Preview mode is on — no files were actually renamed.)"
+            if errors:
+                shown = errors[:10]
+                msg += "\n\nErrors:\n" + "\n".join(shown)
+                if len(errors) > 10:
+                    msg += f"\n… and {len(errors) - 10} more"
+            messagebox.showinfo("Retroactive Rename", msg)
+            self._refresh_unnamed_count()
+            dlg.destroy()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(pady=(0, 16))
+        ttk.Button(btn_row, text="Apply Selected", bootstyle="primary",
+                   command=_apply_selected).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row, text="Cancel", bootstyle="secondary-outline",
+                   command=dlg.destroy).pack(side=tk.LEFT, padx=6)
+
     # ── Tab 3: Settings ───────────────────────────────────────
+
 
     def _build_settings_tab(self):
         tab = ttk.Frame(self.notebook)
         self._settings_tab_frame = tab
         self.notebook.add(tab, text="  Settings  ")
+
+        # Registries the generic load/save/reset/dependency logic below
+        # walks — every setting built through add_row+register / add_bool /
+        # add_mode3 / add_mode2 ends up in _settings_registry, so a setting
+        # that's on this tab always round-trips (see _load_settings_to_ui,
+        # _save_settings). _bool_setting_specs is the smaller subset of
+        # checkboxes that have a prerequisite (dep_key) — the only ones
+        # _refresh_settings_dependencies ever touches.
+        self._settings_registry = {}
+        self._bool_setting_specs = []
 
         # ── Pinned footer (always visible at the bottom) ──────
         # Pack BEFORE the scroll canvas so pack reserves its space first.
@@ -5468,6 +6107,13 @@ class ScandocsApp(ttk.Window):
         outer = ttk.Frame(outer, padding=(20, 15, 20, 15))
         outer.pack(fill=tk.BOTH, expand=True)
 
+        # ── Shared builder helpers ─────────────────────────────
+        def register(path, var, kind, **meta):
+            """Record one setting so _load_settings_to_ui / _save_settings /
+            reset-to-defaults / export-import all handle it automatically."""
+            self._settings_registry[path] = dict(var=var, kind=kind, **meta)
+            return var
+
         def add_row(parent, row_idx, label_text, str_var,
                     browse_dir=False, browse_file=False, masked=False, info_msg=None):
             ttk.Label(parent, text=label_text).grid(
@@ -5500,6 +6146,89 @@ class ScandocsApp(ttk.Window):
                 )
                 _q.grid(row=row_idx, column=3, padx=(0, 4))
 
+        def add_reset_button(labelframe, title, paths):
+            """Small per-section reset button, corner-anchored so it works
+            regardless of whether the frame's children use grid or pack."""
+            ttk.Button(
+                labelframe, text="Reset", width=7, bootstyle="link",
+                command=lambda: self._reset_settings_section(title, paths),
+            ).place(relx=1.0, x=-2, y=0, anchor="ne")
+
+        def section_header(text, subtitle=None):
+            ttk.Label(outer, text=text, font=(APP_FONT, 13, "bold")).pack(
+                anchor="w", pady=(16, 2))
+            if subtitle:
+                ttk.Label(outer, text=subtitle, font=(APP_FONT, 8),
+                          foreground="gray").pack(anchor="w", pady=(0, 8))
+
+        def add_bool(parent, path, label_text, help_text, dep_key=None):
+            """One checkbox + a plain-English help line beneath it, wired
+            into the settings registry (and, if dep_key is given, into the
+            dependency-greying registry — see _refresh_settings_dependencies)."""
+            section, key = path.split(".", 1)
+            attr = f"s_{section}_{key}_var"
+            var = tk.BooleanVar(value=False)
+            setattr(self, attr, var)
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, padx=8, pady=(4, 0))
+            chk = ttk.Checkbutton(row, text=label_text, variable=var)
+            chk.pack(anchor="w")
+            ttk.Label(row, text="    " + help_text, font=(APP_FONT, 8),
+                      foreground="gray", wraplength=640, justify="left").pack(anchor="w")
+            reason_lbl = None
+            if dep_key:
+                reason_lbl = ttk.Label(row, text="", font=(APP_FONT, 8, "italic"),
+                                        foreground="#b35c00", wraplength=640, justify="left")
+                reason_lbl.pack(anchor="w")
+                self._bool_setting_specs.append({
+                    "checkbutton": chk, "dep_key": dep_key, "reason_label": reason_lbl,
+                })
+            register(path, var, "bool")
+            return chk
+
+        def add_mode3(parent, key, label_text, help_text):
+            """A 3-state Off / Suggest only / Automatic combobox for one of
+            the learning.* settings — see learning_mode_to_display/_to_config."""
+            var = tk.StringVar(value="Off")
+            attr = f"s_learning_{key}_var"
+            setattr(self, attr, var)
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, padx=8, pady=(4, 0))
+            ttk.Label(row, text=label_text).pack(side=tk.LEFT)
+            combo = ttk.Combobox(row, textvariable=var, values=LEARNING_MODE_VALUES,
+                                  state="readonly", width=16)
+            combo.pack(side=tk.LEFT, padx=(8, 0))
+            _disable_combobox_scroll(combo)
+            ttk.Label(parent, text="    " + help_text, font=(APP_FONT, 8),
+                      foreground="gray", wraplength=640, justify="left").pack(
+                anchor="w", padx=8, pady=(0, 6))
+            register(f"learning.{key}", var, "mode3")
+            return combo
+
+        def add_mode2(parent, key, label_text, help_text):
+            """Retroactive rename's 2-state Off / Preview only combobox —
+            deliberately no 'Automatic'. See retroactive_mode_to_display/_to_config."""
+            var = tk.StringVar(value="Off")
+            attr = f"s_learning_{key}_var"
+            setattr(self, attr, var)
+            row = ttk.Frame(parent)
+            row.pack(fill=tk.X, padx=8, pady=(4, 0))
+            ttk.Label(row, text=label_text).pack(side=tk.LEFT)
+            combo = ttk.Combobox(row, textvariable=var, values=RETROACTIVE_MODE_VALUES,
+                                  state="readonly", width=16)
+            combo.pack(side=tk.LEFT, padx=(8, 0))
+            _disable_combobox_scroll(combo)
+            ttk.Label(parent, text="    " + help_text, font=(APP_FONT, 8),
+                      foreground="gray", wraplength=640, justify="left").pack(
+                anchor="w", padx=8, pady=(0, 6))
+            register(f"learning.{key}", var, "mode2")
+            return combo
+
+        # ══════════════════════════════════════════════════════
+        # TIER 1 — Everyday
+        # ══════════════════════════════════════════════════════
+        section_header("Everyday")
+
         # Paths
         paths_lf = ttk.LabelFrame(outer, text="Paths")
         paths_lf.pack(fill=tk.X, pady=(0, 10))
@@ -5508,9 +6237,11 @@ class ScandocsApp(ttk.Window):
         self.s_client_list_var = tk.StringVar()
         add_row(paths_lf, 0, "Scandocs Folder:", self.s_scandocs_var, browse_dir=True)
         add_row(paths_lf, 1, "Client List File:", self.s_client_list_var, browse_file=True)
+        register("paths.scandocs_folder", self.s_scandocs_var, "str")
+        register("paths.client_list_file", self.s_client_list_var, "str")
 
-        # API
-        api_lf = ttk.LabelFrame(outer, text="API Settings")
+        # API / Model
+        api_lf = ttk.LabelFrame(outer, text="API & Model")
         api_lf.pack(fill=tk.X, pady=(0, 10))
         api_lf.columnconfigure(1, weight=1)
         self.s_owui_url_var = tk.StringVar()
@@ -5549,10 +6280,231 @@ class ScandocsApp(ttk.Window):
                     "Leave blank if your server does not require authentication "
                     "(typical for local setups)."
                 ))
+        register("api.openwebui_url", self.s_owui_url_var, "str")
+        register("api.ollama_url", self.s_ollama_url_var, "str")
+        register("api.model", self.s_model_var, "str")
+        register("api.api_key", self.s_api_key_var, "str")
+
+        # Behavior — the two switches with the most visible consequences
+        behavior_lf = ttk.LabelFrame(outer, text="Behavior")
+        behavior_lf.pack(fill=tk.X, pady=(0, 10))
+        add_reset_button(behavior_lf, "Behavior", ["automation.dry_run"])
+
+        self.s_automation_dry_run_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            behavior_lf,
+            text="Preview mode — process files but don't rename or move anything",
+            variable=self.s_automation_dry_run_var,
+        ).pack(anchor="w", padx=8, pady=(8, 0))
+        ttk.Label(
+            behavior_lf,
+            text="    Runs the whole batch and shows what WOULD happen, without touching "
+                 "any files. A big yellow banner appears on the Process tab whenever this "
+                 "is on, so a preview run is never mistaken for a real one.",
+            font=(APP_FONT, 8), foreground="gray", wraplength=640, justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+        register("automation.dry_run", self.s_automation_dry_run_var, "bool")
+
+        self.s_automation_watch_folder_var = tk.BooleanVar(value=False)
+        ttk.Checkbutton(
+            behavior_lf,
+            text="Process automatically when files arrive",
+            variable=self.s_automation_watch_folder_var,
+            state=tk.DISABLED,
+        ).pack(anchor="w", padx=8, pady=(0, 0))
+        ttk.Label(
+            behavior_lf,
+            text="    Not yet active — this only saves the setting for now. Nothing "
+                 "watches the folder in the background yet; you still need to click "
+                 "Auto-Process Documents yourself. Coming in a future update.",
+            font=(APP_FONT, 8, "italic"), foreground="#b35c00",
+            wraplength=640, justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 8))
+        register("automation.watch_folder", self.s_automation_watch_folder_var, "bool")
+
+        # ══════════════════════════════════════════════════════
+        # TIER 2 — Features (grouped by what can go wrong)
+        # ══════════════════════════════════════════════════════
+        section_header("Features",
+                        "Turn individual behaviors on or off. Each one explains itself.")
+
+        # ── Naming ──────────────────────────────────────────
+        naming_lf = ttk.LabelFrame(outer, text="Naming")
+        naming_lf.pack(fill=tk.X, pady=(0, 10))
+        add_reset_button(naming_lf, "Naming", [
+            "naming.preserve_acronyms", "naming.use_templates", "naming.include_recipient",
+            "naming.include_doc_date", "naming.date_disambiguation", "naming.split_unknown_states",
+        ])
+        add_bool(naming_lf, "naming.preserve_acronyms",
+                 "Preserve acronyms in names (PPR, TTD, IME)",
+                 "Keeps known acronyms in full capitals instead of Title Case when building a filename.")
+        add_bool(naming_lf, "naming.use_templates",
+                 "Use document-type naming templates",
+                 "Builds each filename using a template chosen by document type (e.g. adds the date "
+                 "to Progress Reports) instead of the plain 'Client - Description' format.")
+        add_bool(naming_lf, "naming.include_recipient",
+                 'Add recipient to name ("to Chiropractic Works")',
+                 "Appends who the document was sent to or received from, when known.",
+                 dep_key="naming.include_recipient")
+        add_bool(naming_lf, "naming.include_doc_date",
+                 "Add document date to progress reports",
+                 "Includes the date found on the document itself, not just today's date.")
+        add_bool(naming_lf, "naming.date_disambiguation",
+                 "Number duplicates by date instead of (1)",
+                 'When the same client/description appears twice, use the document date to tell '
+                 'them apart instead of appending "(1)", "(2)", etc.')
+        add_bool(naming_lf, "naming.split_unknown_states",
+                 'Separate "unknown client" from "needs review"',
+                 "Uses two different labels: one when a name was read but isn't on the client list, "
+                 "and another when no name could be read at all.")
+
+        # ── Reading documents ────────────────────────────────
+        reading_lf = ttk.LabelFrame(outer, text="Reading Documents")
+        reading_lf.pack(fill=tk.X, pady=(0, 10))
+        add_reset_button(reading_lf, "Reading Documents", [
+            "reading.skip_fax_cover_pages", "reading.deskew_photos",
+            "reading.vision_escalation", "reading.extract_claim_numbers",
+        ])
+        add_bool(reading_lf, "reading.skip_fax_cover_pages",
+                 "Skip fax cover and transmission report pages",
+                 "Ignores the cover sheet and confirmation page so the AI reads the actual document.")
+        add_bool(reading_lf, "reading.deskew_photos",
+                 "Straighten and crop photographed pages",
+                 "Auto-rotates and trims photos of documents (as opposed to flatbed scans) before reading them.")
+        add_bool(reading_lf, "reading.vision_escalation",
+                 "Re-read with vision model when text is unclear",
+                 "If the extracted text looks too poor to trust, automatically re-reads the page as "
+                 "an image with the vision model instead.",
+                 dep_key="reading.vision_escalation")
+        add_bool(reading_lf, "reading.extract_claim_numbers",
+                 "Find claim numbers and injury dates",
+                 "Pulls out workers'-comp claim numbers and injury dates when present, for claim linking.")
+
+        # ── Understanding documents ───────────────────────────
+        classification_lf = ttk.LabelFrame(outer, text="Understanding Documents")
+        classification_lf.pack(fill=tk.X, pady=(0, 10))
+        add_reset_button(classification_lf, "Understanding Documents", [
+            "classification.structured_output", "classification.use_document_types",
+            "classification.use_providers", "classification.extract_recipient",
+            "classification.grounding_check", "classification.evidence_confidence",
+            "classification.use_candidate_shortlist",
+        ])
+        add_bool(classification_lf, "classification.structured_output",
+                 "Ask the model for structured details",
+                 "Requests a structured answer (client, document type, recipient, date, etc.) instead "
+                 "of free-form text. Several other settings below require this to be on.")
+        add_bool(classification_lf, "classification.use_document_types",
+                 "Use the document type list",
+                 "Matches the AI's answer against your Document Types list so wording stays consistent.",
+                 dep_key="classification.use_document_types")
+        add_bool(classification_lf, "classification.use_providers",
+                 "Use the provider list",
+                 "Matches recipients/senders against your Providers list so names stay consistent.",
+                 dep_key="classification.use_providers")
+        add_bool(classification_lf, "classification.extract_recipient",
+                 "Identify who the document is going to",
+                 "Has the AI identify the recipient (e.g. a clinic or insurer) separately from the client.",
+                 dep_key="classification.extract_recipient")
+        add_bool(classification_lf, "classification.grounding_check",
+                 "Verify the client name appears in the document",
+                 "Double-checks that the client name the AI returned is actually present in the text "
+                 "before trusting it.")
+        add_bool(classification_lf, "classification.evidence_confidence",
+                 "Judge confidence from evidence instead of the model's own guess",
+                 "Calculates how confident to be from what was actually found in the document, rather "
+                 "than trusting the AI's self-reported confidence.")
+        add_bool(classification_lf, "classification.use_candidate_shortlist",
+                 "Narrow the client list before asking",
+                 "Sends the AI a shortlist of the most likely clients instead of the full list, which "
+                 "can improve accuracy on large client lists.")
+
+        # Re-evaluate dependent Naming/Understanding controls whenever any
+        # of their prerequisites change.
+        self.s_classification_structured_output_var.trace_add(
+            "write", lambda *_: self._refresh_settings_dependencies())
+        self.s_classification_extract_recipient_var.trace_add(
+            "write", lambda *_: self._refresh_settings_dependencies())
+        self.s_model_var.trace_add(
+            "write", lambda *_: self._refresh_settings_dependencies())
+
+        # ── Learning ──────────────────────────────────────────
+        learn_lf = ttk.LabelFrame(outer, text="Learning")
+        learn_lf.pack(fill=tk.X, pady=(0, 10))
+        add_reset_button(learn_lf, "Learning", [
+            "learning.document_types", "learning.client_relationships", "learning.claim_linking",
+            "learning.log_corrections", "learning.observations_required",
+            "learning.few_shot_examples", "learning.retroactive_rename",
+        ])
+        add_mode3(learn_lf, "document_types", "Learn document types:",
+                  "Off: never suggest new document types. Suggest only: shows candidates on the "
+                  "Suggestions tab for approval. Automatic: adds them without asking.")
+        add_mode3(learn_lf, "client_relationships", "Learn client relationships:",
+                  "Learns who else's mail belongs under a given client (e.g. a passenger on the "
+                  "client's accident). Suggest only surfaces a suggestion; Automatic files future "
+                  "documents under the client once confirmed.")
+        add_mode3(learn_lf, "claim_linking", "Link documents by claim number:",
+                  "Uses a workers'-comp claim number to identify the client on future documents that "
+                  "share the same claim number.")
+        add_bool(learn_lf, "learning.log_corrections",
+                 "Remember corrections",
+                 "Keeps a private log of every correction an employee makes. This is the foundation "
+                 "the three settings above and 'Use past corrections as examples' below all read "
+                 "from — turning it off stops all learning, even 'Suggest only' modes.")
+        _obs_row = ttk.Frame(learn_lf)
+        _obs_row.pack(fill=tk.X, padx=8, pady=(4, 0))
+        ttk.Label(_obs_row, text="Times seen before suggesting:").pack(side=tk.LEFT)
+        self.s_learning_observations_required_var = tk.StringVar(value="3")
+        _obs_spin = ttk.Spinbox(
+            _obs_row, from_=2, to=10, textvariable=self.s_learning_observations_required_var,
+            width=6, state="readonly",
+        )
+        _obs_spin.pack(side=tk.LEFT, padx=(8, 0))
+        _disable_combobox_scroll(_obs_spin)
+        ttk.Label(
+            learn_lf,
+            text="    How many distinct documents must agree on the same guess before it's suggested "
+                 "for approval. Higher = fewer, more confident suggestions.",
+            font=(APP_FONT, 8), foreground="gray", wraplength=640, justify="left",
+        ).pack(anchor="w", padx=8, pady=(0, 6))
+        register("learning.observations_required", self.s_learning_observations_required_var,
+                  "int_str", min=2, max=10, label="Times seen before suggesting")
+        add_bool(learn_lf, "learning.few_shot_examples",
+                 "Use past corrections as examples",
+                 "Shows the AI a few similar past corrections to help it get today's document right.")
+        add_mode2(learn_lf, "retroactive_rename", "Retroactively rename old files:",
+                  "When a new client relationship is confirmed, offers to rename past files that used "
+                  "the same guess. Deliberately has no 'Automatic' option — a person always reviews "
+                  "the list on-screen before anything is renamed.")
+
+        # ══════════════════════════════════════════════════════
+        # TIER 3 — Advanced (collapsed by default)
+        # ══════════════════════════════════════════════════════
+        self._advanced_expanded = False
+        adv_header = ttk.Frame(outer)
+        adv_header.pack(fill=tk.X, pady=(16, 0))
+        self._advanced_toggle_btn = ttk.Button(
+            adv_header, text="▶  Advanced Settings", bootstyle="link",
+            command=self._toggle_advanced_settings,
+        )
+        self._advanced_toggle_btn.pack(anchor="w")
+        ttk.Label(
+            adv_header,
+            text="Fine-tuning for someone comfortable with the technical details. "
+                 "Most people never need to open this.",
+            font=(APP_FONT, 8), foreground="gray",
+        ).pack(anchor="w", padx=(4, 0))
+        self._advanced_frame = ttk.Frame(outer)
+        # Not packed yet — _toggle_advanced_settings shows/hides it.
+        advanced_frame = self._advanced_frame
 
         # Processing
-        proc_lf = ttk.LabelFrame(outer, text="Processing")
+        proc_lf = ttk.LabelFrame(advanced_frame, text="Processing")
         proc_lf.pack(fill=tk.X, pady=(0, 10))
+        add_reset_button(proc_lf, "Processing", [
+            "processing.fuzzy_threshold", "processing.max_ocr_chars", "processing.max_pages",
+            "processing.max_vision_pages", "processing.candidate_list_size",
+            "processing.ocr_preprocess", "processing.require_high_confidence",
+        ])
         proc_lf.columnconfigure(1, weight=1)
         self.s_threshold_var = tk.StringVar()
         self.s_max_chars_var = tk.StringVar()
@@ -5587,6 +6539,13 @@ class ScandocsApp(ttk.Window):
                     "slowing down the batch. Client names and document types are "
                     "almost always found within the first few pages."
                 ))
+        register("processing.fuzzy_threshold", self.s_threshold_var, "float_str",
+                  min=0.0, max=1.0, label="Fuzzy Match Threshold")
+        register("processing.max_ocr_chars", self.s_max_chars_var, "int_str",
+                  min=100, label="Max OCR Characters")
+        register("processing.max_pages", self.s_max_pages_var, "int_str",
+                  min=1, label="Max Pages Per Document")
+
         ttk.Checkbutton(
             proc_lf,
             text="Require high confidence — only rename when AI is confident (recommended)",
@@ -5597,6 +6556,7 @@ class ScandocsApp(ttk.Window):
             text="  When unchecked, medium-confidence results are also renamed (more matches, higher false-positive risk)",
             font=(APP_FONT, 8), foreground="gray",
         ).grid(row=4, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        register("processing.require_high_confidence", self.s_require_high_conf_var, "bool")
 
         self.s_ocr_preprocess_var = tk.BooleanVar(value=True)
         ttk.Checkbutton(
@@ -5624,6 +6584,7 @@ class ScandocsApp(ttk.Window):
             text="  Upscales, normalizes contrast, and binarizes each page image — adds ~100–300ms per page",
             font=(APP_FONT, 8), foreground="gray",
         ).grid(row=9, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        register("processing.ocr_preprocess", self.s_ocr_preprocess_var, "bool")
 
         # ── Text Extraction Method (OCR vs Vision) ────────────────
         self.s_extraction_method_var = tk.StringVar()
@@ -5690,18 +6651,71 @@ class ScandocsApp(ttk.Window):
         self.s_model_var.trace_add(
             "write", lambda *_: self._apply_extraction_method_ui()
         )
+        register("processing.max_vision_pages", self.s_max_vision_pages_var, "int_str",
+                  min=1, label="Max Vision Pages")
+
+        # candidate list size — how many clients get shortlisted (classification.use_candidate_shortlist)
+        self.s_candidate_list_size_var = tk.StringVar()
+        add_row(proc_lf, 10, "Candidate List Size:", self.s_candidate_list_size_var,
+                info_msg=(
+                    "Candidate List Size\n\n"
+                    "How many likely clients are shortlisted for the AI when "
+                    "'Narrow the client list before asking' is turned on.\n\n"
+                    "A smaller list is faster and can improve accuracy on very "
+                    "large client lists; too small a list risks leaving the "
+                    "correct client out."
+                ))
+        register("processing.candidate_list_size", self.s_candidate_list_size_var,
+                  "int_str", min=1, label="Candidate List Size")
+
+        # Reading details
+        reading_adv_lf = ttk.LabelFrame(advanced_frame, text="Reading Details")
+        reading_adv_lf.pack(fill=tk.X, pady=(0, 10))
+        reading_adv_lf.columnconfigure(1, weight=1)
+        self.s_escalation_threshold_var = tk.StringVar()
+        add_row(reading_adv_lf, 0, "Vision Escalation Threshold (0.0 – 1.0):",
+                self.s_escalation_threshold_var,
+                info_msg=(
+                    "Vision Escalation Threshold\n\n"
+                    "When 'Re-read with vision model when text is unclear' is on, this is "
+                    "the text-quality score below which a page is re-read with the vision "
+                    "model instead of trusted as OCR text.\n\n"
+                    "Lower = only the worst pages get escalated (faster). "
+                    "Higher = more pages get the extra vision pass (slower, more thorough)."
+                ))
+        register("reading.escalation_threshold", self.s_escalation_threshold_var,
+                  "float_str", min=0.0, max=1.0, label="Vision Escalation Threshold")
+
+        # API timeouts
+        timeout_lf = ttk.LabelFrame(advanced_frame, text="API Timeouts")
+        timeout_lf.pack(fill=tk.X, pady=(0, 10))
+        timeout_lf.columnconfigure(1, weight=1)
+        self.s_timeout_connect_var = tk.StringVar()
+        self.s_timeout_read_var = tk.StringVar()
+        add_row(timeout_lf, 0, "Connect Timeout (seconds):", self.s_timeout_connect_var)
+        add_row(timeout_lf, 1, "Read Timeout (seconds):", self.s_timeout_read_var)
+        register("api.timeout_connect", self.s_timeout_connect_var, "int_str",
+                  min=1, label="Connect Timeout")
+        register("api.timeout_read", self.s_timeout_read_var, "int_str",
+                  min=1, label="Read Timeout")
 
         # Reports
-        rep_lf = ttk.LabelFrame(outer, text="Reports")
+        rep_lf = ttk.LabelFrame(advanced_frame, text="Reports")
         rep_lf.pack(fill=tk.X, pady=(0, 10))
+        add_reset_button(rep_lf, "Reports", [
+            "reports.report_folder", "reports.auto_save",
+            "processing.audit_mode", "processing.show_manual_entry_tab",
+        ])
         rep_lf.columnconfigure(1, weight=1)
         self.s_report_folder_var = tk.StringVar()
         add_row(rep_lf, 0, "Report Folder:", self.s_report_folder_var, browse_dir=True)
+        register("reports.report_folder", self.s_report_folder_var, "str")
         self.s_auto_save_var = tk.BooleanVar()
         ttk.Checkbutton(
             rep_lf, text="Auto-save report when batch completes",
             variable=self.s_auto_save_var,
         ).grid(row=1, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        register("reports.auto_save", self.s_auto_save_var, "bool")
 
         self.s_audit_mode_var = tk.BooleanVar()
         ttk.Checkbutton(
@@ -5725,6 +6739,7 @@ class ScandocsApp(ttk.Window):
             bootstyle="primary-outline",
         )
         _q_audit.grid(row=2, column=3, padx=(0, 4), pady=(0, 4), sticky="w")
+        register("processing.audit_mode", self.s_audit_mode_var, "bool")
 
         self.s_file_mode_var = tk.BooleanVar()
         ttk.Checkbutton(
@@ -5746,6 +6761,7 @@ class ScandocsApp(ttk.Window):
             bootstyle="primary-outline",
         )
         _q_file.grid(row=3, column=3, padx=(0, 4), pady=(0, 2), sticky="w")
+        register("processing.file_mode", self.s_file_mode_var, "bool")
 
         # Sub-checkboxes: per-tab enable
         sub_frame = ttk.Frame(rep_lf)
@@ -5763,6 +6779,8 @@ class ScandocsApp(ttk.Window):
         )
         self._fm_manual_chk.pack(side=tk.LEFT)
         self._file_mode_sub_frame = sub_frame
+        register("processing.file_mode_auto", self.s_file_mode_auto_var, "bool")
+        register("processing.file_mode_manual", self.s_file_mode_manual_var, "bool")
 
         ttk.Checkbutton(
             rep_lf,
@@ -5771,6 +6789,7 @@ class ScandocsApp(ttk.Window):
             variable=self.s_show_manual_tab_var,
             command=self._apply_manual_tab_visibility,
         ).grid(row=6, column=0, columnspan=3, sticky="w", padx=8, pady=(0, 6))
+        register("processing.show_manual_entry_tab", self.s_show_manual_tab_var, "bool")
 
         # ── Suggest Location sub-option ───────────────────────────
         self._fm_suggest_frame = ttk.Frame(rep_lf)
@@ -5807,6 +6826,10 @@ class ScandocsApp(ttk.Window):
             font=(APP_FONT, 8, "italic"),
         ).pack(side=tk.LEFT)
 
+        register("processing.suggest_location_enabled", self.s_suggest_loc_var, "bool")
+        register("processing.suggest_location_parent_folder", self.s_suggest_parent_var, "str")
+        register("processing.file_mode_destination", self.fo_dest_var, "str")
+
         # Buttons + status — pinned to footer so they're always visible
         btn_row = ttk.Frame(_footer_frame)
         btn_row.pack(fill=tk.X)
@@ -5835,107 +6858,344 @@ class ScandocsApp(ttk.Window):
             font=(APP_FONT, 9),
         ).pack(side=tk.RIGHT, padx=(0, 12))
 
+        # Second footer row — settings hygiene: export/import/reset
+        btn_row2 = ttk.Frame(_footer_frame)
+        btn_row2.pack(fill=tk.X, pady=(6, 0))
+        ttk.Button(btn_row2, text="Export Settings…", command=self._export_settings,
+                   bootstyle="secondary-outline").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row2, text="Import Settings…", command=self._import_settings,
+                   bootstyle="secondary-outline").pack(side=tk.LEFT, padx=(0, 8))
+        ttk.Button(btn_row2, text="Reset All Settings to Defaults…",
+                   command=self._reset_all_settings,
+                   bootstyle="danger-outline").pack(side=tk.LEFT)
+
     # ── Settings helpers ──────────────────────────────────────
 
     def _load_settings_to_ui(self):
         cfg = self.config_mgr.config
-        self.s_scandocs_var.set(cfg["paths"]["scandocs_folder"])
-        self.s_client_list_var.set(cfg["paths"]["client_list_file"])
-        self.s_owui_url_var.set(cfg["api"]["openwebui_url"])
-        self.s_ollama_url_var.set(cfg["api"]["ollama_url"])
-        self.s_model_var.set(cfg["api"]["model"])
-        self.s_api_key_var.set(cfg["api"]["api_key"])
-        self.s_threshold_var.set(str(cfg["processing"]["fuzzy_threshold"]))
-        self.s_max_chars_var.set(str(cfg["processing"]["max_ocr_chars"]))
-        self.s_report_folder_var.set(
-            cfg["reports"].get("report_folder", DEFAULT_REPORTS_FOLDER)
-        )
-        self.s_auto_save_var.set(cfg["reports"].get("auto_save", True))
-        self.s_audit_mode_var.set(cfg["processing"].get("audit_mode", True))
-        self.s_file_mode_var.set(cfg["processing"].get("file_mode", False))
-        self.s_file_mode_auto_var.set(cfg["processing"].get("file_mode_auto", True))
-        self.s_file_mode_manual_var.set(cfg["processing"].get("file_mode_manual", True))
-        self.s_show_manual_tab_var.set(cfg["processing"].get("show_manual_entry_tab", False))
-        self.fo_dest_var.set(cfg["processing"].get("file_mode_destination", ""))
-        self.s_suggest_loc_var.set(cfg["processing"].get("suggest_location_enabled", False))
-        self.s_suggest_parent_var.set(cfg["processing"].get("suggest_location_parent_folder", ""))
-        self.s_max_pages_var.set(str(cfg["processing"].get("max_pages", 5)))
-        self.s_require_high_conf_var.set(cfg["processing"].get("require_high_confidence", True))
-        self.s_ocr_preprocess_var.set(cfg["processing"].get("ocr_preprocess", True))
-        # Extraction method
+        # Every setting built via register() in _build_settings_tab round-trips
+        # generically here — see the "kind" handling below. This is what
+        # guarantees a new setting can't silently fail to load.
+        for path, meta in self._settings_registry.items():
+            section, key = path.split(".", 1)
+            section_cfg = cfg.get(section, {}) or {}
+            default_val = DEFAULT_CONFIG.get(section, {}).get(key)
+            raw = section_cfg.get(key, default_val)
+            kind = meta["kind"]
+            var = meta["var"]
+            if kind == "bool":
+                var.set(bool(raw))
+            elif kind == "str":
+                var.set(raw if raw is not None else "")
+            elif kind in ("int_str", "float_str"):
+                var.set(str(raw if raw is not None else default_val))
+            elif kind == "mode3":
+                var.set(learning_mode_to_display(raw))
+            elif kind == "mode2":
+                var.set(retroactive_mode_to_display(raw))
+
+        # Fields whose on-screen representation differs from their stored
+        # form (not a plain scalar) are handled explicitly instead of via
+        # the registry.
         _method = cfg["processing"].get("extraction_method", "ocr")
         self.s_extraction_method_var.set(
             "Use Vision Model" if _method == "vision" else "Use OCR"
         )
-        self.s_max_vision_pages_var.set(
-            str(cfg["processing"].get("max_vision_pages", 2))
-        )
+        if not self.s_report_folder_var.get().strip():
+            self.s_report_folder_var.set(DEFAULT_REPORTS_FOLDER)
+
         self.after(0, self._apply_extraction_method_ui)
         self.after(0, self._apply_audit_mode)
         self.after(0, self._apply_file_mode)
         self.after(0, self._apply_manual_tab_visibility)
+        self.after(0, self._refresh_settings_dependencies)
+        self.after(0, self._apply_dry_run_banner)
         self.after(400, self._apply_round_styling)
         # Populate model list in background (won't block startup)
         self.after(300, self._refresh_models)
 
     def _save_settings(self):
         try:
-            threshold = float(self.s_threshold_var.get())
-            if not (0.0 <= threshold <= 1.0):
-                raise ValueError("Fuzzy match threshold must be between 0.0 and 1.0.")
-            max_chars = int(self.s_max_chars_var.get())
-            if max_chars < 100:
-                raise ValueError("Max OCR characters must be at least 100.")
-            max_pages = int(self.s_max_pages_var.get())
-            if max_pages < 1:
-                raise ValueError("Max pages must be at least 1.")
-            try:
-                max_vision_pages = int(self.s_max_vision_pages_var.get())
-            except ValueError:
-                raise ValueError("Max Vision Pages must be a whole number.")
-            if max_vision_pages < 1:
-                raise ValueError("Max Vision Pages must be at least 1.")
+            for path, meta in self._settings_registry.items():
+                kind = meta["kind"]
+                if kind not in ("int_str", "float_str"):
+                    continue
+                raw = meta["var"].get().strip()
+                label = meta.get("label", path)
+                try:
+                    val = int(raw) if kind == "int_str" else float(raw)
+                except ValueError:
+                    raise ValueError(f"{label} must be a number.")
+                lo, hi = meta.get("min"), meta.get("max")
+                if lo is not None and val < lo:
+                    raise ValueError(f"{label} must be at least {lo}.")
+                if hi is not None and val > hi:
+                    raise ValueError(f"{label} must be at most {hi}.")
         except ValueError as e:
             messagebox.showerror("Invalid Value", str(e))
             return
 
         cfg = self.config_mgr.config
-        cfg["paths"]["scandocs_folder"]   = self.s_scandocs_var.get().strip()
-        cfg["paths"]["client_list_file"]  = self.s_client_list_var.get().strip()
-        cfg["api"]["openwebui_url"]        = self.s_owui_url_var.get().strip()
-        cfg["api"]["ollama_url"]           = self.s_ollama_url_var.get().strip()
-        cfg["api"]["model"]                = self.s_model_var.get().strip()
-        cfg["api"]["api_key"]              = self.s_api_key_var.get().strip()
-        cfg["processing"]["fuzzy_threshold"] = threshold
-        cfg["processing"]["max_ocr_chars"]   = max_chars
-        cfg["processing"]["max_pages"]        = max_pages
-        cfg["reports"]["report_folder"] = (
-            self.s_report_folder_var.get().strip() or DEFAULT_REPORTS_FOLDER
-        )
-        cfg["reports"]["auto_save"] = self.s_auto_save_var.get()
-        cfg["processing"]["audit_mode"]             = self.s_audit_mode_var.get()
-        cfg["processing"]["file_mode"]              = self.s_file_mode_var.get()
-        cfg["processing"]["file_mode_auto"]         = self.s_file_mode_auto_var.get()
-        cfg["processing"]["file_mode_manual"]       = self.s_file_mode_manual_var.get()
-        cfg["processing"]["show_manual_entry_tab"]  = self.s_show_manual_tab_var.get()
-        cfg["processing"]["file_mode_destination"]        = self.fo_dest_var.get().strip()
-        cfg["processing"]["suggest_location_enabled"]     = self.s_suggest_loc_var.get()
-        cfg["processing"]["suggest_location_parent_folder"] = self.s_suggest_parent_var.get().strip()
-        cfg["processing"]["require_high_confidence"]       = self.s_require_high_conf_var.get()
-        cfg["processing"]["ocr_preprocess"]                = self.s_ocr_preprocess_var.get()
+        for path, meta in self._settings_registry.items():
+            section, key = path.split(".", 1)
+            cfg.setdefault(section, {})
+            kind = meta["kind"]
+            var = meta["var"]
+            if kind == "bool":
+                cfg[section][key] = bool(var.get())
+            elif kind == "str":
+                cfg[section][key] = var.get().strip()
+            elif kind == "int_str":
+                cfg[section][key] = int(var.get().strip())
+            elif kind == "float_str":
+                cfg[section][key] = float(var.get().strip())
+            elif kind == "mode3":
+                cfg[section][key] = learning_mode_to_config(var.get())
+            elif kind == "mode2":
+                cfg[section][key] = retroactive_mode_to_config(var.get())
+
         # Extraction method — force OCR if the selected model can't do vision
         _method_label = self.s_extraction_method_var.get()
         _method = "vision" if _method_label == "Use Vision Model" else "ocr"
         if _method == "vision" and not model_supports_vision(cfg["api"]["model"]):
             _method = "ocr"
         cfg["processing"]["extraction_method"] = _method
-        cfg["processing"]["max_vision_pages"]  = max_vision_pages
+
+        if not cfg["reports"].get("report_folder", "").strip():
+            cfg["reports"]["report_folder"] = DEFAULT_REPORTS_FOLDER
+
         self.config_mgr.save(cfg)
         self._apply_audit_mode()
         self._apply_file_mode()
+        self._apply_manual_tab_visibility()
+        self._refresh_settings_dependencies()
+        self._apply_dry_run_banner()
         self._refresh_client_list_tab()
         self._refresh_unnamed_count()
         messagebox.showinfo("Saved", "Settings saved successfully.")
+
+    # ── Dependency guarding (Pass 7 §2) ───────────────────────
+
+    def _refresh_settings_dependencies(self):
+        """Grey out (and explain) every Settings control whose prerequisite
+        isn't met right now. Called on load, on save, and via trace_add
+        whenever a prerequisite checkbox or the model changes."""
+        if not hasattr(self, "_bool_setting_specs"):
+            return
+        cfg_snapshot = {
+            "classification": {
+                "structured_output": getattr(
+                    self, "s_classification_structured_output_var", tk.BooleanVar(value=False)
+                ).get(),
+                "extract_recipient": getattr(
+                    self, "s_classification_extract_recipient_var", tk.BooleanVar(value=False)
+                ).get(),
+            },
+            "api": {"model": self.s_model_var.get() if hasattr(self, "s_model_var") else ""},
+        }
+        dep_state = compute_settings_dependency_state(cfg_snapshot)
+        for spec in self._bool_setting_specs:
+            dep_key = spec.get("dep_key")
+            if not dep_key:
+                continue
+            disabled, reason = dep_state.get(dep_key, (False, ""))
+            try:
+                spec["checkbutton"].configure(state=(tk.DISABLED if disabled else tk.NORMAL))
+                if spec.get("reason_label") is not None:
+                    spec["reason_label"].configure(text=reason)
+            except tk.TclError:
+                pass  # widget destroyed (shouldn't happen, but never crash on a trace callback)
+
+    # ── Collapsible Advanced section ──────────────────────────
+
+    def _toggle_advanced_settings(self):
+        self._advanced_expanded = not getattr(self, "_advanced_expanded", False)
+        if self._advanced_expanded:
+            self._advanced_frame.pack(fill=tk.X, pady=(4, 0))
+            self._advanced_toggle_btn.configure(text="▼  Advanced Settings")
+        else:
+            self._advanced_frame.pack_forget()
+            self._advanced_toggle_btn.configure(text="▶  Advanced Settings")
+
+    # ── Preview-mode banner (Process tab) ─────────────────────
+
+    def _apply_dry_run_banner(self):
+        if not hasattr(self, "_preview_banner"):
+            return
+        dry_run = self.config_mgr.config.get("automation", {}).get("dry_run", False)
+        if dry_run:
+            self._preview_banner.pack(fill=tk.X, before=self._process_btn_row)
+        else:
+            self._preview_banner.pack_forget()
+
+    # ── Reset to defaults (Pass 7 §5) ─────────────────────────
+
+    def _reset_one_field(self, path):
+        meta = self._settings_registry.get(path)
+        if not meta:
+            return
+        section, key = path.split(".", 1)
+        default_val = DEFAULT_CONFIG.get(section, {}).get(key)
+        kind = meta["kind"]
+        var = meta["var"]
+        if kind == "bool":
+            var.set(bool(default_val))
+        elif kind == "str":
+            var.set(default_val if default_val is not None else "")
+        elif kind in ("int_str", "float_str"):
+            var.set(str(default_val))
+        elif kind == "mode3":
+            var.set(learning_mode_to_display(default_val))
+        elif kind == "mode2":
+            var.set(retroactive_mode_to_display(default_val))
+
+    def _reset_settings_section(self, title, paths):
+        if not messagebox.askyesno(
+            "Reset Section",
+            f'Reset all settings in "{title}" to their defaults?\n\n'
+            "This only changes what's on screen — click Save Settings to keep it.",
+        ):
+            return
+        for path in paths:
+            self._reset_one_field(path)
+        self._refresh_settings_dependencies()
+
+    def _reset_all_settings(self):
+        if not messagebox.askyesno(
+            "Reset All Settings",
+            "Reset ALL settings on this tab to their defaults?\n\n"
+            "This only changes what's on screen — click Save Settings to keep it.",
+        ):
+            return
+        for path in list(self._settings_registry.keys()):
+            self._reset_one_field(path)
+        self._refresh_settings_dependencies()
+
+    # ── Export / import settings (Pass 7 §5) ──────────────────
+
+    def _export_settings(self):
+        path = filedialog.asksaveasfilename(
+            title="Export Settings",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile="scandocs_settings.json",
+        )
+        if not path:
+            return
+        try:
+            data = ConfigManager._deep_copy(self.config_mgr.config)
+            data.get("api", {})["api_key"] = ""  # never write the API key to a shared file
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, indent=2)
+            messagebox.showinfo(
+                "Exported",
+                f"Settings exported to:\n{path}\n\n"
+                "The API key was left blank for safety — re-enter it after importing "
+                "on another machine.",
+            )
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+
+    def _import_settings(self):
+        path = filedialog.askopenfilename(
+            title="Import Settings",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("File does not contain a settings object.")
+        except Exception as e:
+            messagebox.showerror("Import Failed", f"Could not read settings file:\n{e}")
+            return
+        if not messagebox.askyesno(
+            "Import Settings",
+            f"This will replace your current settings with the ones in\n{os.path.basename(path)}.\n\n"
+            "Continue?",
+        ):
+            return
+        merged = ConfigManager._deep_merge(ConfigManager._deep_copy(DEFAULT_CONFIG), data)
+        self.config_mgr.save(merged)
+        self._load_settings_to_ui()
+        self._refresh_settings_dependencies()
+        messagebox.showinfo("Imported", "Settings imported successfully.")
+
+    # ── Undo last rename batch (Pass 7 §4) ────────────────────
+
+    def _show_undo_dialog(self):
+        log = RenameLog()
+        batches = log.last_batches(15)
+        dlg = tk.Toplevel(self)
+        dlg.title("Undo Last Rename Batch")
+        dlg.resizable(False, False)
+        dlg.transient(self)
+        dlg.grab_set()
+        self.update_idletasks()
+        x = self.winfo_x() + (self.winfo_width() - 540) // 2
+        y = self.winfo_y() + (self.winfo_height() - 420) // 2
+        dlg.geometry(f"540x420+{x}+{y}")
+
+        ttk.Label(
+            dlg,
+            text="Choose a batch to undo. This reverses renames/moves, most-recent\n"
+                 "first, back to their original names.",
+            font=(APP_FONT, 10),
+        ).pack(anchor="w", padx=16, pady=(16, 8))
+
+        if not batches:
+            ttk.Label(dlg, text="No rename batches recorded yet.",
+                      foreground="gray").pack(padx=16, pady=20)
+            ttk.Button(dlg, text="Close", command=dlg.destroy).pack(pady=(0, 16))
+            return
+
+        list_frame = ttk.Frame(dlg)
+        list_frame.pack(fill=tk.BOTH, expand=True, padx=16, pady=(0, 8))
+        lb = tk.Listbox(list_frame, font=(APP_FONT, 10), height=10)
+        sb = ttk.Scrollbar(list_frame, orient="vertical", command=lb.yview)
+        lb.configure(yscrollcommand=sb.set)
+        sb.pack(side=tk.RIGHT, fill=tk.Y)
+        lb.pack(fill=tk.BOTH, expand=True)
+        for b in batches:
+            ts = (b.get("last_ts") or "")[:19].replace("T", " ")
+            n = b.get("count", 0)
+            lb.insert(tk.END, f"{ts} — {n} file{'s' if n != 1 else ''} — batch {b.get('batch_id', '')}")
+        lb.selection_set(0)
+        self._bind_mousewheel(lb, lambda e: lb.yview_scroll(
+            -1 * (e.delta // 120) if e.delta else (-1 if e.num == 4 else 1), "units"))
+
+        def _do_undo():
+            sel = lb.curselection()
+            if not sel:
+                return
+            batch = batches[sel[0]]
+            ts_disp = (batch.get("last_ts") or "")[:19].replace("T", " ")
+            if not messagebox.askyesno(
+                "Confirm Undo",
+                f"Undo batch from {ts_disp}\n({batch.get('count', 0)} file(s))?\n\n"
+                "A file already moved or renamed again since then will be skipped, "
+                "not overwritten.",
+            ):
+                return
+            undone, skipped, errors = log.undo_batch(batch.get("batch_id", ""))
+            msg = f"Undone: {undone}\nSkipped: {skipped}"
+            if errors:
+                shown = errors[:10]
+                msg += "\n\nErrors:\n" + "\n".join(shown)
+                if len(errors) > 10:
+                    msg += f"\n… and {len(errors) - 10} more"
+            messagebox.showinfo("Undo Complete", msg)
+            self._refresh_unnamed_count()
+            dlg.destroy()
+
+        btn_row = ttk.Frame(dlg)
+        btn_row.pack(pady=(0, 16))
+        ttk.Button(btn_row, text="Undo Selected Batch", bootstyle="danger",
+                   command=_do_undo).pack(side=tk.LEFT, padx=6)
+        ttk.Button(btn_row, text="Close", bootstyle="secondary-outline",
+                   command=dlg.destroy).pack(side=tk.LEFT, padx=6)
 
     def _browse_dir(self, var: tk.StringVar):
         init = var.get() or SCRIPT_DIR
@@ -6547,10 +7807,12 @@ class ScandocsApp(ttk.Window):
             return
 
         dry_run = self.config_mgr.config.get("automation", {}).get("dry_run", False)
-        # Clearly-visible indicator when preview mode is on — window title
-        # and status bar both reflect it, re-evaluated at the start of
-        # every batch so it stays in sync if the config changes between runs.
+        # Clearly-visible indicator when preview mode is on — window title,
+        # the Process tab banner, and the status bar all reflect it,
+        # re-evaluated at the start of every batch so it stays in sync if
+        # the config changes between runs.
         self.title(APP_TITLE + (" — PREVIEW MODE (no files will be renamed)" if dry_run else ""))
+        self._apply_dry_run_banner()
 
         # Clear old results
         self._hide_manual_correction()
@@ -6730,11 +7992,64 @@ class ScandocsApp(ttk.Window):
         return rows
 
     @staticmethod
-    def _save_xlsx(path: str, headers: list, rows: list, results: list = None):
+    def _config_flags_snapshot(cfg: dict) -> list:
+        """Flatten the feature-flag portions of `cfg` into (label, value)
+        pairs, stamped into every report (Pass 7 §5) — 'what was turned on'
+        is the first question when a batch looks wrong."""
+        def yn(v):
+            return "On" if v else "Off"
+        naming = cfg.get("naming", {}) or {}
+        reading = cfg.get("reading", {}) or {}
+        classification = cfg.get("classification", {}) or {}
+        learning = cfg.get("learning", {}) or {}
+        processing = cfg.get("processing", {}) or {}
+        automation = cfg.get("automation", {}) or {}
+        api = cfg.get("api", {}) or {}
+        return [
+            ("Model", api.get("model", "")),
+            ("Extraction Method",
+             "Vision" if processing.get("extraction_method") == "vision" else "OCR"),
+            ("Preview Mode (dry run)", yn(automation.get("dry_run", False))),
+            ("Require High Confidence", yn(processing.get("require_high_confidence", True))),
+            ("", ""),
+            ("Naming: Preserve Acronyms", yn(naming.get("preserve_acronyms", False))),
+            ("Naming: Use Templates", yn(naming.get("use_templates", False))),
+            ("Naming: Include Recipient", yn(naming.get("include_recipient", False))),
+            ("Naming: Include Doc Date", yn(naming.get("include_doc_date", False))),
+            ("Naming: Date Disambiguation", yn(naming.get("date_disambiguation", False))),
+            ("Naming: Split Unknown States", yn(naming.get("split_unknown_states", False))),
+            ("", ""),
+            ("Reading: Skip Fax Cover Pages", yn(reading.get("skip_fax_cover_pages", False))),
+            ("Reading: Deskew Photos", yn(reading.get("deskew_photos", False))),
+            ("Reading: Vision Escalation", yn(reading.get("vision_escalation", False))),
+            ("Reading: Extract Claim Numbers", yn(reading.get("extract_claim_numbers", False))),
+            ("", ""),
+            ("Classification: Structured Output", yn(classification.get("structured_output", False))),
+            ("Classification: Use Document Types", yn(classification.get("use_document_types", False))),
+            ("Classification: Use Providers", yn(classification.get("use_providers", False))),
+            ("Classification: Extract Recipient", yn(classification.get("extract_recipient", False))),
+            ("Classification: Grounding Check", yn(classification.get("grounding_check", False))),
+            ("Classification: Evidence Confidence", yn(classification.get("evidence_confidence", False))),
+            ("Classification: Candidate Shortlist", yn(classification.get("use_candidate_shortlist", False))),
+            ("", ""),
+            ("Learning: Document Types", learning_mode_to_display(learning.get("document_types", "off"))),
+            ("Learning: Client Relationships",
+             learning_mode_to_display(learning.get("client_relationships", "off"))),
+            ("Learning: Claim Linking", learning_mode_to_display(learning.get("claim_linking", "off"))),
+            ("Learning: Log Corrections", yn(learning.get("log_corrections", True))),
+            ("Learning: Retroactive Rename",
+             retroactive_mode_to_display(learning.get("retroactive_rename", "off"))),
+        ]
+
+    @staticmethod
+    def _save_xlsx(path: str, headers: list, rows: list, results: list = None,
+                    config: dict = None):
         """Write an Excel workbook with auto-fitted columns and a styled header row.
         Rows where 'Audit: Wrong Client' is 'Yes' are highlighted in red — these
         are the most critical errors and must be easy to spot.
-        If `results` is provided, a Summary sheet is added."""
+        If `results` is provided, a Summary sheet is added. If `config` is
+        provided, a Configuration sheet stamps which feature flags were on
+        for this run."""
         wb = openpyxl.Workbook()
         ws = wb.active
         ws.title = "Results"
@@ -6853,15 +8168,37 @@ class ScandocsApp(ttk.Window):
             ss.column_dimensions["A"].width = 42
             ss.column_dimensions["B"].width = 18
 
+        # ── Configuration sheet — what was turned on for this run ──
+        if config is not None:
+            cs = wb.create_sheet("Configuration")
+            title_font = Font(bold=True, size=14, color="1F497D")
+            label_font = Font(bold=True, size=11)
+            value_font = Font(size=11)
+            cs.append(["Configuration"])
+            cs["A1"].font = title_font
+            cs.append([])
+            for label, value in ScandocsApp._config_flags_snapshot(config):
+                cs.append([label, value])
+            for row_cells in cs.iter_rows(min_row=3, max_row=cs.max_row, max_col=2):
+                row_cells[0].font = label_font
+                row_cells[1].font = value_font
+            cs.column_dimensions["A"].width = 38
+            cs.column_dimensions["B"].width = 22
+
         wb.save(path)
 
     @staticmethod
-    def _save_csv(path: str, headers: list, rows: list):
+    def _save_csv(path: str, headers: list, rows: list, config: dict = None):
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(headers)
             for row in rows:
                 w.writerow(row)
+            if config is not None:
+                w.writerow([])
+                w.writerow(["Configuration for this run"])
+                for label, value in ScandocsApp._config_flags_snapshot(config):
+                    w.writerow([label, value])
 
     def _write_report(self, folder: str) -> str:
         """Write results to a timestamped report in `folder`. Returns the saved path."""
@@ -6869,12 +8206,13 @@ class ScandocsApp(ttk.Window):
         ts = datetime.datetime.now().strftime("%Y-%m-%d_%H%M%S")
         headers = self._REPORT_HEADERS
         rows = self._results_as_rows()
+        config = self.config_mgr.config
         if _XLSX_AVAILABLE:
             path = os.path.join(folder, f"scandocs_report_{ts}.xlsx")
-            self._save_xlsx(path, headers, rows, results=self._results)
+            self._save_xlsx(path, headers, rows, results=self._results, config=config)
         else:
             path = os.path.join(folder, f"scandocs_report_{ts}.csv")
-            self._save_csv(path, headers, rows)
+            self._save_csv(path, headers, rows, config=config)
         return path
 
 
@@ -8161,10 +9499,11 @@ class ScandocsApp(ttk.Window):
         try:
             headers = self._REPORT_HEADERS
             rows = self._results_as_rows()
+            config = self.config_mgr.config
             if path.lower().endswith(".xlsx") and _XLSX_AVAILABLE:
-                self._save_xlsx(path, headers, rows)
+                self._save_xlsx(path, headers, rows, results=self._results, config=config)
             else:
-                self._save_csv(path, headers, rows)
+                self._save_csv(path, headers, rows, config=config)
             messagebox.showinfo("Exported", f"Report saved to:\n{path}")
         except Exception as e:
             messagebox.showerror("Export Failed", str(e))
