@@ -24,6 +24,10 @@ import queue
 import csv
 import datetime
 import subprocess
+import socket
+import getpass
+import uuid
+import time
 
 try:
     import openpyxl
@@ -115,6 +119,12 @@ else:
 CONFIG_PATH            = os.path.join(_USER_DATA_DIR, "config.json")
 LOG_PATH               = os.path.join(_USER_DATA_DIR, "scandocs_tool.log")
 DEFAULT_REPORTS_FOLDER = os.path.join(_USER_DATA_DIR, "Reports")
+RENAME_LOG_PATH         = os.path.join(_USER_DATA_DIR, "renames.jsonl")
+
+# Instance lock (folder lock) tuning — see FolderLock below.
+LOCK_FILENAME               = ".speedyscandocs.lock"
+LOCK_STALE_SECONDS          = 120   # heartbeat older than this = treat as dead, take over
+LOCK_HEARTBEAT_INTERVAL_SEC = 30    # how often run_batch refreshes the heartbeat
 
 
 def _open_file(path: str):
@@ -475,6 +485,293 @@ class ConfigManager:
     @staticmethod
     def _deep_copy(d: dict) -> dict:
         return json.loads(json.dumps(d))
+
+
+# ─────────────────────────────────────────────────────────────
+# FolderLock — cross-instance / cross-machine batch lock
+# ─────────────────────────────────────────────────────────────
+#
+# The scandocs folder is Dropbox-synced and more than one machine (or more
+# than one copy of the app) can point at it. Without coordination, two
+# concurrent batches will both grab the same file list, and the second one
+# to reach a given file finds it already renamed out from under it — the
+# paired OK/ERROR row bug this pass fixes. FolderLock is a best-effort
+# cooperative lock file living inside the scandocs folder itself, so every
+# instance pointed at that folder sees it regardless of machine.
+
+class FolderLockHeld(Exception):
+    """Raised by FolderLock.acquire() when another instance's heartbeat
+    proves it is alive right now. This is the one case that must actually
+    block starting a batch — every other lock problem is swallowed."""
+
+    def __init__(self, message: str, info: Optional[dict] = None):
+        super().__init__(message)
+        self.info = info or {}
+
+
+class FolderLock:
+    """Cooperative, best-effort lock file (`.speedyscandocs.lock`) inside a
+    scandocs folder. Use as a context manager:
+
+        with FolderLock(scandocs_folder) as lock:
+            ... run the batch, calling lock.heartbeat() periodically ...
+
+    Acquisition is atomic (O_CREAT | O_EXCL) so two processes racing to
+    create the file cannot both "win". A lock whose heartbeat is fresh
+    (< LOCK_STALE_SECONDS old) blocks acquisition by raising
+    FolderLockHeld; a stale one (crash, or a Stop that somehow skipped
+    release) is logged and taken over. Any other OS-level problem
+    (permissions, a read-only/offline share, etc.) is logged as a warning
+    and acquisition is treated as a no-op success — a lock we can't take
+    is not worth blocking real work over.
+    """
+
+    def __init__(self, folder: str):
+        self.folder = folder
+        self.path = os.path.join(folder, LOCK_FILENAME)
+        self.acquired = False
+        self._last_heartbeat_monotonic: float = 0.0
+
+    # ── internals ────────────────────────────────────────────
+
+    def _read(self) -> Optional[dict]:
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _is_stale(info: dict) -> bool:
+        hb = info.get("heartbeat") or info.get("started")
+        if not hb:
+            return True
+        try:
+            hb_time = datetime.datetime.fromisoformat(hb)
+        except Exception:
+            return True
+        return (datetime.datetime.now() - hb_time).total_seconds() > LOCK_STALE_SECONDS
+
+    @staticmethod
+    def _describe(info: dict) -> str:
+        host = info.get("host") or "another computer"
+        started = info.get("started") or ""
+        started_disp = started
+        try:
+            dt = datetime.datetime.fromisoformat(started)
+            started_disp = dt.strftime("%I:%M %p").lstrip("0") or dt.strftime("%H:%M")
+        except Exception:
+            pass
+        return (
+            f"Another copy of Speedy Scandocs is processing this folder "
+            f"right now ({host}, started {started_disp}). "
+            "Wait for it to finish, or close it and try again."
+        )
+
+    def _new_info(self) -> dict:
+        now = datetime.datetime.now().isoformat()
+        return {
+            "host": socket.gethostname(),
+            "pid": os.getpid(),
+            "user": getpass.getuser(),
+            "started": now,
+            "heartbeat": now,
+        }
+
+    # ── public API ───────────────────────────────────────────
+
+    def acquire(self) -> None:
+        """Take the lock. Raises FolderLockHeld only when another instance
+        is provably alive right now; every other failure is logged and
+        swallowed so a lock problem never blocks real work."""
+        try:
+            existing = self._read()
+            if existing is not None:
+                if self._is_stale(existing):
+                    logging.warning(
+                        "Stale folder lock found (host=%s pid=%s heartbeat=%s) — taking over.",
+                        existing.get("host"), existing.get("pid"), existing.get("heartbeat"),
+                    )
+                    try:
+                        os.remove(self.path)
+                    except FileNotFoundError:
+                        pass
+                else:
+                    raise FolderLockHeld(self._describe(existing), info=existing)
+
+            info = self._new_info()
+            try:
+                fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                # Race: someone else created it between our staleness check
+                # and our own atomic create. Re-read and decide again rather
+                # than assuming either outcome.
+                existing = self._read() or {}
+                if existing and not self._is_stale(existing):
+                    raise FolderLockHeld(self._describe(existing), info=existing)
+                logging.warning("Folder lock race on acquire — proceeding without a lock.")
+                self.acquired = False
+                return
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                json.dump(info, f)
+            self.acquired = True
+            self._last_heartbeat_monotonic = time.monotonic()
+        except FolderLockHeld:
+            raise
+        except Exception as e:
+            logging.warning(f"Could not acquire folder lock ({e}) — proceeding without it.")
+            self.acquired = False
+
+    def heartbeat(self, force: bool = False) -> None:
+        """Refresh the lock's heartbeat timestamp if it's been roughly
+        LOCK_HEARTBEAT_INTERVAL_SEC since the last refresh (or always, if
+        force=True). Meant to be called periodically by the processing
+        thread while a batch runs — no-op if this instance doesn't hold
+        the lock. Never raises."""
+        if not self.acquired:
+            return
+        now = time.monotonic()
+        if not force and (now - self._last_heartbeat_monotonic) < LOCK_HEARTBEAT_INTERVAL_SEC:
+            return
+        try:
+            info = self._read() or self._new_info()
+            info["heartbeat"] = datetime.datetime.now().isoformat()
+            tmp = self.path + ".tmp"
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(info, f)
+            os.replace(tmp, self.path)
+            self._last_heartbeat_monotonic = now
+        except Exception as e:
+            logging.warning(f"Could not refresh folder lock heartbeat: {e}")
+
+    def release(self) -> None:
+        """Release the lock. Safe to call even if acquire() never
+        succeeded, and safe to call more than once."""
+        if not self.acquired:
+            return
+        try:
+            os.remove(self.path)
+        except Exception as e:
+            logging.warning(f"Could not remove folder lock: {e}")
+        self.acquired = False
+
+    def __enter__(self) -> "FolderLock":
+        self.acquire()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.release()
+        return False
+
+
+# ─────────────────────────────────────────────────────────────
+# RenameLog — undo log for every rename/move the app performs
+# ─────────────────────────────────────────────────────────────
+
+def log_rename(batch_id: str, action: str, src: str, dst: str, source: str,
+                log_path: Optional[str] = None) -> None:
+    """Append one JSON-line entry to the undo log. Never raises — a failure
+    to write the undo log must never block or break a real rename/move.
+    `action` is "rename" or "move"; `source` is "auto" | "correction" |
+    "audit" | "move"."""
+    try:
+        entry = {
+            "ts": datetime.datetime.now().isoformat(),
+            "batch_id": batch_id or "manual",
+            "action": action,
+            "from": os.path.abspath(src),
+            "to": os.path.abspath(dst),
+            "source": source,
+        }
+        path = log_path or RENAME_LOG_PATH
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(entry) + "\n")
+    except Exception as e:
+        logging.warning(f"Could not write undo log entry: {e}")
+
+
+class RenameLog:
+    """Reads back what log_rename() wrote, and can undo a whole batch."""
+
+    def __init__(self, path: Optional[str] = None):
+        self.path = path or RENAME_LOG_PATH
+
+    def append(self, entry: dict) -> None:
+        try:
+            os.makedirs(os.path.dirname(self.path), exist_ok=True)
+            with open(self.path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(entry) + "\n")
+        except Exception as e:
+            logging.warning(f"Could not append to rename log: {e}")
+
+    def _read_all(self) -> List[dict]:
+        entries: List[dict] = []
+        try:
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        entries.append(json.loads(line))
+                    except Exception:
+                        continue
+        except FileNotFoundError:
+            pass
+        except Exception as e:
+            logging.warning(f"Could not read rename log: {e}")
+        return entries
+
+    def last_batches(self, n: int = 10) -> List[dict]:
+        """Return up to `n` most-recent batches, most-recent-first:
+        [{"batch_id", "count", "first_ts", "last_ts"}, ...]."""
+        by_batch: dict = {}
+        order: List[str] = []
+        for e in self._read_all():
+            bid = e.get("batch_id", "")
+            if bid not in by_batch:
+                by_batch[bid] = {
+                    "batch_id": bid, "count": 0,
+                    "first_ts": e.get("ts"), "last_ts": e.get("ts"),
+                }
+                order.append(bid)
+            rec = by_batch[bid]
+            rec["count"] += 1
+            rec["last_ts"] = e.get("ts")
+        return [by_batch[b] for b in order][-n:][::-1]
+
+    def undo_batch(self, batch_id: str) -> tuple:
+        """Reverse a batch's renames/moves, most-recent-first. An entry is
+        skipped (not an error) when the file is no longer at its recorded
+        `to` path — someone else has since moved or renamed it — or when
+        something already occupies the original `from` path. Returns
+        (undone, skipped, errors)."""
+        entries = [e for e in self._read_all() if e.get("batch_id") == batch_id]
+        undone = 0
+        skipped = 0
+        errors: List[str] = []
+        for e in reversed(entries):
+            current_path = e.get("to", "")
+            original_path = e.get("from", "")
+            if not current_path or not original_path:
+                skipped += 1
+                continue
+            if not os.path.isfile(current_path):
+                skipped += 1
+                continue
+            if os.path.exists(original_path):
+                skipped += 1
+                errors.append(
+                    f"{os.path.basename(original_path)}: a file already exists at the original path"
+                )
+                continue
+            try:
+                os.rename(current_path, original_path)
+                undone += 1
+            except Exception as ex:
+                errors.append(f"{os.path.basename(current_path)}: {ex}")
+        return (undone, skipped, errors)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1193,10 +1490,15 @@ class APIClient:
 class FileProcessor:
 
     @staticmethod
-    def process_file(file_path: str, config: dict, client_list: list) -> ProcessResult:
+    def process_file(file_path: str, config: dict, client_list: list,
+                      batch_id: str = "", reserved: Optional[set] = None) -> ProcessResult:
         filename = os.path.basename(file_path)
         ext = os.path.splitext(filename)[1].lower()
         proc_cfg = config["processing"]
+        safety_cfg = config.get("safety", {})
+        dry_run = config.get("automation", {}).get("dry_run", False)
+        if reserved is None:
+            reserved = set()
 
         # Skip already-processed files
         if proc_cfg.get("skip_already_processed") and \
@@ -1205,13 +1507,34 @@ class FileProcessor:
                 original_name=filename,
                 final_name=filename,
                 status="skipped",
+                skip_reason="already processed",
             )
 
         try:
             if not os.path.isfile(file_path):
-                raise FileNotFoundError(f"File not found: {file_path}")
-            if os.path.getsize(file_path) == 0:
-                raise ValueError("File is empty (0 bytes)")
+                # Not an error: in a Dropbox-synced folder with more than
+                # one instance running, this is exactly what it looks like
+                # when another pass got to this file first between our
+                # directory listing and now. Nothing to fix, nothing to
+                # alarm the user about.
+                return ProcessResult(
+                    original_name=filename,
+                    final_name=filename,
+                    status="skipped",
+                    skip_reason="already handled by another run",
+                )
+
+            # Dropbox may still be mid-sync. Sample the size twice ~0.6s
+            # apart (repeating up to ~5s total) before reading the file —
+            # a file that's still growing/shrinking isn't safe to OCR yet.
+            settle_skip = FileProcessor._wait_for_settled(file_path)
+            if settle_skip is not None:
+                return ProcessResult(
+                    original_name=filename,
+                    final_name=filename,
+                    status="skipped",
+                    skip_reason=settle_skip,
+                )
 
             doc_hash = FileProcessor._file_hash(file_path)
 
@@ -1301,14 +1624,54 @@ class FileProcessor:
 
             new_name = f"{final_client} - {safe_desc}{ext}"
 
-            # Collision avoidance
+            # Collision avoidance. `reserved` also carries names already
+            # claimed earlier in this batch — needed in dry-run, where
+            # nothing actually lands on disk, so two documents that would
+            # both become the same name must still preview as distinct.
             dest_dir = os.path.dirname(file_path)
-            new_name = FileProcessor._resolve_collision(dest_dir, new_name, filename)
+            new_name = FileProcessor._resolve_collision(dest_dir, new_name, filename, reserved=reserved)
+            reserved.add(new_name)
 
             renamed_at = None
-            if new_name != filename:
-                os.rename(file_path, os.path.join(dest_dir, new_name))
+            if new_name != filename and not dry_run:
+                # Re-validate immediately before touching disk: another
+                # instance (or a stray earlier pass) may have already
+                # claimed this exact file since we started reading it.
+                if not os.path.isfile(file_path):
+                    return ProcessResult(
+                        original_name=filename,
+                        final_name=filename,
+                        status="skipped",
+                        skip_reason="already handled by another run",
+                        doc_hash=doc_hash,
+                    )
+                if safety_cfg.get("recheck_before_rename", True):
+                    current_hash = FileProcessor._file_hash(file_path)
+                    if current_hash != doc_hash:
+                        return ProcessResult(
+                            original_name=filename,
+                            final_name=filename,
+                            status="skipped",
+                            skip_reason="file changed during processing",
+                            doc_hash=doc_hash,
+                        )
+                # Another instance may have renamed this file (to a name
+                # that now looks "already processed") in the time between
+                # our first check and now.
+                if proc_cfg.get("skip_already_processed") and \
+                        FileProcessor._already_processed(filename, client_list):
+                    return ProcessResult(
+                        original_name=filename,
+                        final_name=filename,
+                        status="skipped",
+                        skip_reason="already handled by another run",
+                        doc_hash=doc_hash,
+                    )
+                dest_path = os.path.join(dest_dir, new_name)
+                os.rename(file_path, dest_path)
                 renamed_at = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                if safety_cfg.get("undo_log", True):
+                    log_rename(batch_id, "rename", file_path, dest_path, "auto")
 
             return ProcessResult(
                 original_name=filename,
@@ -1323,6 +1686,7 @@ class FileProcessor:
                 raw_confidence=raw_confidence,
                 extracted_text=extracted_text,
                 doc_hash=doc_hash,
+                was_dry_run=dry_run,
             )
 
         except Exception as e:
@@ -1405,20 +1769,65 @@ class FileProcessor:
         return " ".join(out_tokens).strip()
 
     @staticmethod
-    def _resolve_collision(directory: str, filename: str, source_name: str) -> str:
-        """If `filename` already exists in `directory` (and isn't the source file),
-        append (1), (2), … until a free name is found."""
+    def _resolve_collision(directory: str, filename: str, source_name: str,
+                            reserved: Optional[set] = None) -> str:
+        """If `filename` already exists in `directory` (and isn't the source
+        file) OR has already been claimed via `reserved`, append (1), (2), …
+        until a free name is found.
+
+        `reserved` lets a batch track names it has already handed out to
+        earlier files without relying on the filesystem — essential in
+        dry-run mode, where nothing is actually written to disk, so two
+        documents that would both become the same name must still preview
+        as distinct."""
         if filename == source_name:
             return filename
-        if not os.path.exists(os.path.join(directory, filename)):
+
+        def _taken(name: str) -> bool:
+            return (
+                os.path.exists(os.path.join(directory, name))
+                or (reserved is not None and name in reserved)
+            )
+
+        if not _taken(filename):
             return filename
         base, ext = os.path.splitext(filename)
         counter = 1
         while True:
             candidate = f"{base} ({counter}){ext}"
-            if not os.path.exists(os.path.join(directory, candidate)):
+            if not _taken(candidate):
                 return candidate
             counter += 1
+
+    @staticmethod
+    def _wait_for_settled(file_path: str, max_wait: float = 5.0,
+                           sample_interval: float = 0.6) -> Optional[str]:
+        """Guard against reading a file mid-sync (Dropbox). Samples the file
+        size twice ~`sample_interval` seconds apart, repeating until the
+        size stops changing or `max_wait` seconds have elapsed. Returns
+        None when the file looks settled and non-empty; otherwise a
+        skip_reason string explaining why the file should be skipped
+        for now rather than processed."""
+        try:
+            size = os.path.getsize(file_path)
+        except OSError:
+            return "file still being written"
+        if size == 0:
+            return "empty file (0 bytes)"
+
+        waited = 0.0
+        while waited < max_wait:
+            time.sleep(sample_interval)
+            waited += sample_interval
+            try:
+                new_size = os.path.getsize(file_path)
+            except OSError:
+                return "file still being written"
+            if new_size == size:
+                return "empty file (0 bytes)" if new_size == 0 else None
+            size = new_size
+
+        return "file still being written"
 
     @staticmethod
     def _file_hash(path: str) -> str:
@@ -1455,73 +1864,139 @@ class FileProcessor:
 class ProcessingEngine:
     def __init__(self):
         self._stop_event = threading.Event()
+        self.batch_id: str = ""   # set at the start of each run_batch(); "" before any batch has run
 
     def stop(self):
         self._stop_event.set()
+
+    @staticmethod
+    def _list_supported_files(scandocs: str) -> List[str]:
+        return [
+            f for f in os.listdir(scandocs)
+            if os.path.isfile(os.path.join(scandocs, f))
+            and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
+        ]
 
     def run_batch(self, config: dict, result_queue: queue.Queue):
         self._stop_event.clear()
         scandocs = config["paths"]["scandocs_folder"]
         client_list_path = config["paths"]["client_list_file"]
 
-        try:
-            client_list = ClientListManager.load(client_list_path)
-            if not client_list:
-                result_queue.put({
-                    "type": "error",
-                    "message": (
-                        "The client list is empty.\n\n"
-                        "Go to the Client List tab, add your clients, and save."
-                    ),
-                })
-                result_queue.put({"type": "done"})
-                return
+        self.batch_id = uuid.uuid4().hex[:8]
+        safety_cfg = config.get("safety", {})
+        dry_run = config.get("automation", {}).get("dry_run", False)
+        use_lock = safety_cfg.get("instance_lock", True) and bool(scandocs) and os.path.isdir(scandocs)
 
+        lock = FolderLock(scandocs) if use_lock else None
+        if lock is not None:
             try:
-                all_entries = os.listdir(scandocs)
+                lock.acquire()
+            except FolderLockHeld as e:
+                result_queue.put({"type": "error", "message": str(e)})
+                result_queue.put({"type": "done"})
+                return
+
+        try:
+            try:
+                client_list = ClientListManager.load(client_list_path)
+                if not client_list:
+                    result_queue.put({
+                        "type": "error",
+                        "message": (
+                            "The client list is empty.\n\n"
+                            "Go to the Client List tab, add your clients, and save."
+                        ),
+                    })
+                    result_queue.put({"type": "done"})
+                    return
+
+                try:
+                    files = self._list_supported_files(scandocs)
+                except Exception as e:
+                    result_queue.put({
+                        "type": "error",
+                        "message": f"Cannot read scandocs folder:\n{e}",
+                    })
+                    result_queue.put({"type": "done"})
+                    return
+
+                if not files:
+                    result_queue.put({
+                        "type": "error",
+                        "message": "No PDF or JPG files found in the scandocs folder.",
+                    })
+                    result_queue.put({"type": "done"})
+                    return
+
+                result_queue.put({"type": "total", "count": len(files)})
+
+                # Names claimed so far this batch — carried across files so
+                # dry-run collision resolution doesn't depend on the
+                # filesystem (nothing is actually written to disk then).
+                reserved: set = set()
+
+                for i, filename in enumerate(files):
+                    if self._stop_event.is_set():
+                        result_queue.put({"type": "stopped"})
+                        break
+                    result_queue.put({
+                        "type": "progress",
+                        "current": i + 1,
+                        "filename": filename,
+                    })
+                    result = FileProcessor.process_file(
+                        os.path.join(scandocs, filename), config, client_list,
+                        batch_id=self.batch_id, reserved=reserved,
+                    )
+                    result_queue.put({"type": "result", "result": result})
+                    if lock is not None:
+                        lock.heartbeat()
+
+                # Straggler pickup: a Dropbox-synced folder can gain new
+                # files while this batch was running (another workstation
+                # scanning in, or Dropbox finishing a sync). One extra
+                # sweep — never more — for anything that showed up and
+                # isn't already accounted for.
+                if not self._stop_event.is_set() and not dry_run:
+                    try:
+                        current = set(self._list_supported_files(scandocs))
+                        stragglers = sorted(current - set(files))
+                        stragglers = [
+                            f for f in stragglers
+                            if not (config["processing"].get("skip_already_processed")
+                                    and FileProcessor._already_processed(f, client_list))
+                        ]
+                    except Exception as e:
+                        logging.warning(f"Straggler sweep could not list folder: {e}")
+                        stragglers = []
+
+                    logging.info(f"Straggler sweep: {len(stragglers)} newly-arrived file(s) found.")
+
+                    for filename in stragglers:
+                        if self._stop_event.is_set():
+                            result_queue.put({"type": "stopped"})
+                            break
+                        result_queue.put({
+                            "type": "progress",
+                            "current": len(files),
+                            "filename": f"{filename} (newly arrived)",
+                        })
+                        result = FileProcessor.process_file(
+                            os.path.join(scandocs, filename), config, client_list,
+                            batch_id=self.batch_id, reserved=reserved,
+                        )
+                        result_queue.put({"type": "result", "result": result})
+                        if lock is not None:
+                            lock.heartbeat()
+
             except Exception as e:
-                result_queue.put({
-                    "type": "error",
-                    "message": f"Cannot read scandocs folder:\n{e}",
-                })
+                logging.error(f"Unhandled batch error: {e}", exc_info=True)
+                result_queue.put({"type": "error", "message": str(e)})
+            finally:
                 result_queue.put({"type": "done"})
-                return
-
-            files = [
-                f for f in all_entries
-                if os.path.isfile(os.path.join(scandocs, f))
-                and os.path.splitext(f)[1].lower() in SUPPORTED_EXTENSIONS
-            ]
-
-            if not files:
-                result_queue.put({
-                    "type": "error",
-                    "message": "No PDF or JPG files found in the scandocs folder.",
-                })
-                result_queue.put({"type": "done"})
-                return
-
-            result_queue.put({"type": "total", "count": len(files)})
-
-            for i, filename in enumerate(files):
-                if self._stop_event.is_set():
-                    result_queue.put({"type": "stopped"})
-                    break
-                result_queue.put({
-                    "type": "progress",
-                    "current": i + 1,
-                    "filename": filename,
-                })
-                result = FileProcessor.process_file(
-                    os.path.join(scandocs, filename), config, client_list
-                )
-                result_queue.put({"type": "result", "result": result})
-
-        except Exception as e:
-            logging.error(f"Unhandled batch error: {e}", exc_info=True)
-            result_queue.put({"type": "error", "message": str(e)})
         finally:
-            result_queue.put({"type": "done"})
+            if lock is not None:
+                lock.release()
 
 
 # ─────────────────────────────────────────────────────────────
@@ -3667,19 +4142,29 @@ class ScandocsApp(ttk.Window):
                 "skipping the rename for this file.")
             return True
 
+        dry_run = self.config_mgr.config.get("automation", {}).get("dry_run", False)
+
         ext      = os.path.splitext(current_name)[1].lower()
         safe_sub = FileProcessor._safe_subject(subject) or "Document"
         new_name = f"{client} - {safe_sub}{ext}"
 
         if new_name != current_name:
             new_name = FileProcessor._resolve_collision(scandocs, new_name, current_name)
-            try:
-                os.rename(os.path.join(scandocs, current_name), os.path.join(scandocs, new_name))
-            except Exception as e:
-                messagebox.showwarning(
-                    "Rename Failed",
-                    f"Could not rename the file:\n{e}\n\nMoving on without renaming.")
-                return True
+            if dry_run:
+                self.status_var.set("Preview mode is on — no files were renamed.")
+            else:
+                old_path = os.path.join(scandocs, current_name)
+                new_path = os.path.join(scandocs, new_name)
+                try:
+                    os.rename(old_path, new_path)
+                    if self.config_mgr.config.get("safety", {}).get("undo_log", True):
+                        log_rename(getattr(self.engine, "batch_id", "") or "manual",
+                                   "rename", old_path, new_path, "correction")
+                except Exception as e:
+                    messagebox.showwarning(
+                        "Rename Failed",
+                        f"Could not rename the file:\n{e}\n\nMoving on without renaming.")
+                    return True
         else:
             new_name = current_name
 
@@ -3687,11 +4172,12 @@ class ScandocsApp(ttk.Window):
         result.client               = client
         result.description          = subject
         result.status               = "renamed"
+        result.was_dry_run          = dry_run
         result.audit_corrected_name = new_name
 
         vals = list(self.results_tree.item(iid, "values"))
         vals[2] = new_name   # New Name
-        vals[3] = "OK"       # Status
+        vals[3] = "OK (preview)" if dry_run else "OK"   # Status
         vals[4] = client     # Client
         self.results_tree.item(iid, values=vals, tags=("renamed",))
 
@@ -3734,6 +4220,12 @@ class ScandocsApp(ttk.Window):
             self.notebook.select(self._settings_tab_frame)
             return
 
+        dry_run = self.config_mgr.config.get("automation", {}).get("dry_run", False)
+        # Clearly-visible indicator when preview mode is on — window title
+        # and status bar both reflect it, re-evaluated at the start of
+        # every batch so it stays in sync if the config changes between runs.
+        self.title(APP_TITLE + (" — PREVIEW MODE (no files will be renamed)" if dry_run else ""))
+
         # Clear old results
         self._hide_manual_correction()
         for row in self.results_tree.get_children():
@@ -3761,7 +4253,9 @@ class ScandocsApp(ttk.Window):
                   self.audit_bad_desc_chk, self.audit_failed_client_chk,
                   self.audit_should_flag_chk):
             w.config(state=tk.DISABLED)
-        self.status_var.set("Starting…")
+        self.status_var.set(
+            "Starting… — PREVIEW MODE: no files will be renamed" if dry_run else "Starting…"
+        )
         self.btn_process.config(state=tk.DISABLED)
         self.btn_stop.config(state=tk.NORMAL)
         # Reset audit submit button for new run
@@ -4066,8 +4560,16 @@ class ScandocsApp(ttk.Window):
             "skipped":      "Skipped",
             "error":        "ERROR",
         }.get(result.status, result.status)
+        if result.was_dry_run and result.status in ("renamed", "needs_review"):
+            label += " (preview)"
 
-        client_cell = result.client if result.client else (result.error_message or "")[:60]
+        # skip_reason takes priority — it's the whole point of a skipped
+        # row — then the resolved client, then the error message.
+        client_cell = (
+            result.skip_reason if result.skip_reason
+            else result.client if result.client
+            else (result.error_message or "")[:60]
+        )
         iid = self.results_tree.insert(
             "", tk.END,
             values=(
@@ -4333,7 +4835,17 @@ class ScandocsApp(ttk.Window):
         return dest
 
     def _fo_do_move(self, result: ProcessResult, dest: str, iid: str) -> bool:
-        """Move a single file to dest. Returns True on success."""
+        """Move a single file to dest. Returns True on success (including a
+        successful *preview* when dry-run is on — nothing is touched)."""
+        dry_run = self.config_mgr.config.get("automation", {}).get("dry_run", False)
+        if dry_run:
+            self.status_var.set("Preview mode is on — no files were moved.")
+            vals = list(self.results_tree.item(iid, "values"))
+            vals[5] = f"{os.path.basename(dest)} (preview)"
+            self.results_tree.item(iid, values=vals)
+            result.was_dry_run = True
+            return True
+
         if not os.path.isdir(dest):
             try:
                 os.makedirs(dest, exist_ok=True)
@@ -4362,6 +4874,9 @@ class ScandocsApp(ttk.Window):
             import shutil
             shutil.move(src, dst)
             result.moved_to = dst
+            if self.config_mgr.config.get("safety", {}).get("undo_log", True):
+                log_rename(getattr(self.engine, "batch_id", "") or "manual",
+                           "move", src, dst, "move")
             # Update the New Location column (index 5) in the treeview row
             vals = list(self.results_tree.item(iid, "values"))
             vals[5] = os.path.basename(dest)
@@ -5152,6 +5667,7 @@ class ScandocsApp(ttk.Window):
             messagebox.showinfo("No Results", "No results to submit. Run processing first.")
             return
         scandocs = self.config_mgr.config["paths"]["scandocs_folder"]
+        dry_run = self.config_mgr.config.get("automation", {}).get("dry_run", False)
         errors = []
 
         for result in self._results:
@@ -5176,11 +5692,19 @@ class ScandocsApp(ttk.Window):
             if new_name == current_name:
                 continue
 
+            if dry_run:
+                # Preview mode — do not touch disk.
+                continue
+
             src = os.path.join(scandocs, current_name)
             if os.path.isfile(src):
                 resolved = FileProcessor._resolve_collision(scandocs, new_name, current_name)
                 try:
-                    os.rename(src, os.path.join(scandocs, resolved))
+                    dst = os.path.join(scandocs, resolved)
+                    os.rename(src, dst)
+                    if self.config_mgr.config.get("safety", {}).get("undo_log", True):
+                        log_rename(getattr(self.engine, "batch_id", "") or "manual",
+                                   "rename", src, dst, "audit")
                     result.final_name = resolved
                     result.audit_corrected_name = resolved
                     # Refresh the treeview row
@@ -5234,6 +5758,8 @@ class ScandocsApp(ttk.Window):
         self.btn_submit_audit.config(state=tk.DISABLED, text="Audit Submitted ✓")
 
         msg = f"Audit submitted.\nReport saved to:\n{audit_folder_name}/"
+        if dry_run:
+            msg += "\n\nPreview mode is on — flagged files were not renamed."
         if wrong_client_copies:
             msg += f"\n\n{len(wrong_client_copies)} Wrong Client file(s) copied to audit folder."
         if errors:
